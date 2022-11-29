@@ -1,0 +1,606 @@
+From 6021d8f49ad4fd9dea821294f366713ab270cfea Mon Sep 17 00:00:00 2001
+From: Sudhakar M K <sudhakar.mk@samsung.com>
+Date: Tue, 23 Feb 2021 17:39:15 +0900
+Subject: [PATCH] FIM reservation patch from AMD
+
+This commit adds a patch from AMD for ROCM4.0 platform for reserving memory for FIM
+during system init
+
+Signed-off-by: Sudhakar M K <sudhakar.mk@samsung.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |   2 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c    |  13 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h    |   4 +
+ .../gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c  |  47 +++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c       |   8 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h       |   1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c    | 160 ++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.h    |   7 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c       |  68 ++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c      |   5 +
+ drivers/gpu/drm/amd/amdkfd/kfd_crat.c         |  19 +++
+ drivers/gpu/drm/amd/amdkfd/kfd_topology.h     |   3 +
+ .../gpu/drm/amd/include/kgd_kfd_interface.h   |   1 +
+ include/uapi/linux/kfd_ioctl.h                |   1 +
+ 14 files changed, 336 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 85ed160c7c81..73841a829d49 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -187,6 +187,7 @@ extern int amdgpu_mcbp;
+ extern int amdgpu_discovery;
+ extern int amdgpu_mes;
+ extern int amdgpu_noretry;
++extern int amdgpu_fim_size;
+ extern int amdgpu_force_asic_type;
+ #ifdef CONFIG_HSA_AMD
+ extern int sched_policy;
+@@ -816,6 +817,7 @@ struct amdgpu_device {
+ 	uint32_t			bios_size;
+ 	uint32_t			bios_scratch_reg_offset;
+ 	uint32_t			bios_scratch[AMDGPU_BIOS_NUM_SCRATCH];
++	struct amdgpu_bo		*fim_memory;
+ 
+ 	/* Direct GMA */
+ 	struct amdgpu_direct_gma	direct_gma;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+index 5982b1f4144c..00c48642de29 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
+@@ -67,8 +67,11 @@ void amdgpu_amdkfd_device_probe(struct amdgpu_device *adev)
+ 	adev->kfd.dev = kgd2kfd_probe((struct kgd_dev *)adev,
+ 				      adev->pdev, adev->asic_type, vf);
+ 
+-	if (adev->kfd.dev)
++	if (adev->kfd.dev) {
+ 		amdgpu_amdkfd_total_mem_size += adev->gmc.real_vram_size;
++		if (adev->fim_memory)
++			amdgpu_amdkfd_total_mem_size -= amdgpu_bo_size(adev->fim_memory);
++	}
+ }
+ 
+ /**
+@@ -396,14 +399,18 @@ void amdgpu_amdkfd_get_local_mem_info(struct kgd_dev *kgd,
+ 	aper_limit = adev->gmc.aper_base + adev->gmc.aper_size;
+ 
+ 	memset(mem_info, 0, sizeof(*mem_info));
++	if (adev->fim_memory)
++		mem_info->local_mem_size_fim = amdgpu_bo_size(adev->fim_memory);
+ 	if (pcie_p2p && !(adev->gmc.aper_base & address_mask ||
+ 			  aper_limit & address_mask)) {
+-		mem_info->local_mem_size_public = adev->gmc.visible_vram_size;
++		mem_info->local_mem_size_public = adev->gmc.visible_vram_size -
++			        mem_info->local_mem_size_fim;
+ 		mem_info->local_mem_size_private = adev->gmc.real_vram_size -
+ 				adev->gmc.visible_vram_size;
+ 	} else {
+ 		mem_info->local_mem_size_public = 0;
+-		mem_info->local_mem_size_private = adev->gmc.real_vram_size;
++		mem_info->local_mem_size_private = adev->gmc.real_vram_size -
++                                mem_info->local_mem_size_fim;
+ 	}
+ 	mem_info->vram_width = adev->gmc.vram_width;
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+index 508fca41ca1b..9ea29ce0486a 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -258,6 +258,10 @@ int amdgpu_amdkfd_gpuvm_import_dmabuf(struct kgd_dev *kgd,
+ 				      uint64_t va, void *vm,
+ 				      struct kgd_mem **mem, uint64_t *size,
+ 				      uint64_t *mmap_offset);
++int amdgpu_amdkfd_gpuvm_import_fim(struct kgd_dev *kgd,
++                                   uint64_t va, uint64_t size,
++                                   void *vm, struct kgd_mem **mem,
++                                   uint64_t *offset);
+ int amdgpu_amdkfd_gpuvm_export_ipc_obj(struct kgd_dev *kgd, void *vm,
+ 				       struct kgd_mem *mem,
+ 				       struct kfd_ipc_obj **ipc_obj);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index 32838fed950d..ee25bb894e9c 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -129,6 +129,9 @@ static int amdgpu_amdkfd_reserve_mem_limit(struct amdgpu_device *adev,
+ 	acc_size = ttm_bo_dma_acc_size(&adev->mman.bdev, size,
+ 				       sizeof(struct amdgpu_bo));
+ 
++        if (adev->fim_memory)
++                reserved_for_pt += amdgpu_bo_size(adev->fim_memory);
++
+ 	vram_needed = 0;
+ 	if (domain == AMDGPU_GEM_DOMAIN_GTT) {
+ 		/* TTM GTT memory */
+@@ -1886,6 +1889,50 @@ void amdgpu_amdkfd_gpuvm_unpin_put_sg_table(
+ 	unpin_bo_wo_map(mem);
+ }
+ 
++int amdgpu_amdkfd_gpuvm_import_fim(struct kgd_dev *kgd,
++                                   uint64_t va, uint64_t size,
++                                   void *vm, struct kgd_mem **mem,
++                                   uint64_t *mmap_offset)
++{
++        struct amdgpu_device *adev = (struct amdgpu_device *)kgd;
++        struct amdgpu_vm *avm = (struct amdgpu_vm *)vm;
++        struct amdgpu_bo *bo = adev->fim_memory;
++
++        if (!bo)
++                return -EINVAL;
++        if (size != amdgpu_bo_size(bo))
++                return -EINVAL;
++
++        *mem = kzalloc(sizeof(struct kgd_mem), GFP_KERNEL);
++        if (!*mem)
++                return -ENOMEM;
++
++        if (mmap_offset)
++                *mmap_offset = amdgpu_bo_mmap_offset(bo);
++
++        INIT_LIST_HEAD(&(*mem)->bo_va_list);
++        mutex_init(&(*mem)->lock);
++
++        /* TODO: Check if KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE is required.
++         *       This flag is set for non-fim allocation.
++         */
++        (*mem)->alloc_flags = KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE |
++                              KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
++
++        (*mem)->bo = amdgpu_bo_ref(bo);
++        (*mem)->va = va;
++        (*mem)->domain = AMDGPU_GEM_DOMAIN_VRAM;
++        (*mem)->mapped_to_gpu_memory = 0;
++        (*mem)->process_info = avm->process_info;
++        /* Don't add the pinned BO to the validated list, but initialize
++         * the list head to avoid surprises when releasing the buffer.
++         */
++        INIT_LIST_HEAD(&(*mem)->validate_list.head);
++        amdgpu_sync_create(&(*mem)->sync);
++
++        return 0;
++}
++
+ int amdgpu_amdkfd_gpuvm_import_dmabuf(struct kgd_dev *kgd,
+ 				      struct dma_buf *dma_buf,
+ 				      struct kfd_ipc_obj *ipc_obj,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 4f2b20ff6175..27795f39af39 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -164,6 +164,7 @@ struct amdgpu_mgpu_info mgpu_info = {
+ int amdgpu_ras_enable = -1;
+ uint amdgpu_ras_mask = 0xffffffff;
+ int amdgpu_bad_page_threshold = -1;
++int amdgpu_fim_size = -1;
+ 
+ /**
+  * DOC: vramlimit (int)
+@@ -528,6 +529,13 @@ module_param_named(ras_enable, amdgpu_ras_enable, int, 0444);
+ MODULE_PARM_DESC(ras_mask, "Mask of RAS features to enable (default 0xffffffff), only valid when ras_enable == 1");
+ module_param_named(ras_mask, amdgpu_ras_mask, uint, 0444);
+ 
++/**
++ * DOC: fim_size (int)
++ * Reserved size of VRAM for FIM
++ */
++MODULE_PARM_DESC(fim_size, "Reserved size of VRAM for FIM (-1 = auto (default))");
++module_param_named(fim_size, amdgpu_fim_size, int, 0444);
++
+ /**
+  * DOC: si_support (int)
+  * Set SI support driver. This parameter works after set config CONFIG_DRM_AMDGPU_SI. For SI asic, when radeon driver is enabled,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+index d61bbde4c7d2..308bdd75d9c3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.h
+@@ -216,6 +216,7 @@ struct amdgpu_gmc {
+ 	uint32_t                srbm_soft_reset;
+ 	bool			prt_warning;
+ 	uint32_t		sdpif_register;
++        uint64_t                fim_size;
+ 	/* apertures */
+ 	u64			shared_aperture_start;
+ 	u64			shared_aperture_end;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 6cb17fd5a9ef..80f3732e031d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -327,6 +327,102 @@ int amdgpu_bo_create_reserved(struct amdgpu_device *adev,
+ 	return r;
+ }
+ 
++/**
++ * amdgpu_bo_create_reserved_fim - create reserved BO for fim use
++ *
++ * @adev: amdgpu device object
++ * @size: size for the new BO
++ * @align: alignment for the new BO
++ * @domain: where to place it
++ * @bo_ptr: used to initialize BOs in structures
++ * @gpu_addr: GPU addr of the pinned BO
++ * @cpu_addr: optional CPU address mapping
++ *
++ * Allocates and pins a BO for fim internal use, and returns it still
++ * reserved.
++ *
++ * Note: For bo_ptr new BO is only created if bo_ptr points to NULL.
++ *
++ * Returns:
++ * 0 on success, negative error code otherwise.
++ */
++int amdgpu_bo_create_reserved_fim(struct amdgpu_device *adev,
++			      unsigned long size, int align,
++			      u32 domain, struct amdgpu_bo **bo_ptr,
++			      u64 *gpu_addr, void **cpu_addr)
++{
++	struct amdgpu_bo_param bp;
++	bool free = false;
++	int r;
++
++	if (!size) {
++		amdgpu_bo_unref(bo_ptr);
++		return 0;
++	}
++
++	memset(&bp, 0, sizeof(bp));
++	bp.size = size;
++	bp.byte_align = align;
++	bp.domain = domain;
++	bp.flags = cpu_addr ? AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED
++		: AMDGPU_GEM_CREATE_NO_CPU_ACCESS;
++	bp.flags |= AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS;
++	bp.type = ttm_bo_type_device;
++	bp.resv = NULL;
++
++	if (!*bo_ptr) {
++		r = amdgpu_bo_create(adev, &bp, bo_ptr);
++		if (r) {
++			dev_err(adev->dev, "(%d) failed to allocate device bo\n",
++				r);
++			return r;
++		}
++		free = true;
++	}
++
++	r = amdgpu_bo_reserve(*bo_ptr, false);
++	if (r) {
++		dev_err(adev->dev, "(%d) failed to reserve device bo\n", r);
++		goto error_free;
++	}
++
++	r = amdgpu_bo_pin(*bo_ptr, domain);
++	if (r) {
++		dev_err(adev->dev, "(%d) device bo pin failed\n", r);
++		goto error_unreserve;
++	}
++
++	r = amdgpu_ttm_alloc_gart(&(*bo_ptr)->tbo);
++	if (r) {
++		dev_err(adev->dev, "%p bind failed\n", *bo_ptr);
++		goto error_unpin;
++	}
++
++	if (gpu_addr)
++		*gpu_addr = amdgpu_bo_gpu_offset(*bo_ptr);
++
++	if (cpu_addr) {
++		r = amdgpu_bo_kmap(*bo_ptr, cpu_addr);
++		if (r) {
++			dev_err(adev->dev, "(%d) device bo map failed\n", r);
++			goto error_unpin;
++		}
++	}
++
++	return 0;
++
++error_unpin:
++	amdgpu_bo_unpin(*bo_ptr);
++error_unreserve:
++	amdgpu_bo_unreserve(*bo_ptr);
++
++error_free:
++	if (free)
++		amdgpu_bo_unref(bo_ptr);
++
++	return r;
++}
++
+ /**
+  * amdgpu_bo_create_kernel - create BO for kernel use
+  *
+@@ -431,6 +527,70 @@ int amdgpu_bo_create_kernel_at(struct amdgpu_device *adev,
+ 	return r;
+ }
+ 
++/**
++ * amdgpu_bo_create_device_at - create BO for device use at specific location
++ *
++ * @adev: amdgpu device object
++ * @offset: offset of the BO
++ * @size: size of the BO
++ * @domain: where to place it
++ * @bo_ptr:  used to initialize BOs in structures
++ * @cpu_addr: optional CPU address mapping
++ *
++ * Creates a device BO at a specific offset in the address space of the domain.
++ *
++ * Returns:
++ * 0 on success, negative error code otherwise.
++ */
++int amdgpu_bo_create_device_at(struct amdgpu_device *adev,
++			       uint64_t offset, uint64_t size, uint32_t domain,
++			       struct amdgpu_bo **bo_ptr, void **cpu_addr)
++{
++	struct ttm_operation_ctx ctx = { false, false };
++	unsigned int i;
++	int r;
++
++	offset &= PAGE_MASK;
++	size = ALIGN(size, PAGE_SIZE);
++
++	r = amdgpu_bo_create_reserved_fim(adev, size, PAGE_SIZE, domain, bo_ptr,
++				      NULL, cpu_addr);
++	if (r)
++		return r;
++
++	/*
++	 * Remove the original mem node and create a new one at the request
++	 * position.
++	 */
++	if (cpu_addr)
++		amdgpu_bo_kunmap(*bo_ptr);
++
++	ttm_bo_mem_put(&(*bo_ptr)->tbo, &(*bo_ptr)->tbo.mem);
++
++	for (i = 0; i < (*bo_ptr)->placement.num_placement; ++i) {
++		(*bo_ptr)->placements[i].fpfn = offset >> PAGE_SHIFT;
++		(*bo_ptr)->placements[i].lpfn = (offset + size) >> PAGE_SHIFT;
++	}
++	r = ttm_bo_mem_space(&(*bo_ptr)->tbo, &(*bo_ptr)->placement,
++			     &(*bo_ptr)->tbo.mem, &ctx);
++	if (r)
++		goto error;
++
++	if (cpu_addr) {
++		r = amdgpu_bo_kmap(*bo_ptr, cpu_addr);
++		if (r)
++			goto error;
++	}
++
++	amdgpu_bo_unreserve(*bo_ptr);
++	return 0;
++
++error:
++	amdgpu_bo_unreserve(*bo_ptr);
++	amdgpu_bo_unref(bo_ptr);
++	return r;
++}
++
+ /**
+  * amdgpu_bo_free_kernel - free BO for kernel use
+  *
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index 59d13916c55a..44bcaf9db484 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -261,6 +261,10 @@ int amdgpu_bo_create_reserved(struct amdgpu_device *adev,
+ 			      unsigned long size, int align,
+ 			      u32 domain, struct amdgpu_bo **bo_ptr,
+ 			      u64 *gpu_addr, void **cpu_addr);
++int amdgpu_bo_create_reserved_fim(struct amdgpu_device *adev,
++				unsigned long size, int align,
++				u32 domain, struct amdgpu_bo **bo_ptr,
++				u64 *gpu_addr, void **cpu_addr);
+ int amdgpu_bo_create_kernel(struct amdgpu_device *adev,
+ 			    unsigned long size, int align,
+ 			    u32 domain, struct amdgpu_bo **bo_ptr,
+@@ -268,6 +272,9 @@ int amdgpu_bo_create_kernel(struct amdgpu_device *adev,
+ int amdgpu_bo_create_kernel_at(struct amdgpu_device *adev,
+ 			       uint64_t offset, uint64_t size, uint32_t domain,
+ 			       struct amdgpu_bo **bo_ptr, void **cpu_addr);
++int amdgpu_bo_create_device_at(struct amdgpu_device *adev,
++			       uint64_t offset, uint64_t size, uint32_t domain,
++			       struct amdgpu_bo **bo_ptr, void **cpu_addr);
+ void amdgpu_bo_free_kernel(struct amdgpu_bo **bo, u64 *gpu_addr,
+ 			   void **cpu_addr);
+ int amdgpu_bo_kmap(struct amdgpu_bo *bo, void **ptr);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 41305f4b5a2e..7c09bdd570a4 100755
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -233,6 +233,7 @@ static void amdgpu_evict_flags(struct ttm_buffer_object *bo,
+ static int amdgpu_verify_access(struct ttm_buffer_object *bo, struct file *filp)
+ {
+ 	struct amdgpu_bo *abo = ttm_to_amdgpu_bo(bo);
++        struct amdgpu_device *adev = amdgpu_ttm_adev(bo->bdev);
+ 
+ 	/*
+ 	 * Don't verify access for KFD BOs. They don't have a GEM
+@@ -241,6 +242,12 @@ static int amdgpu_verify_access(struct ttm_buffer_object *bo, struct file *filp)
+ 	if (abo->kfd_bo)
+ 		return 0;
+ 
++        /*
++         * Don't verify access for FIM BO
++         */
++        if (abo == adev->fim_memory)
++                return 0;
++
+ 	if (amdgpu_ttm_tt_get_usermm(bo->ttm))
+ 		return -EPERM;
+ 	return drm_vma_node_verify_access(&abo->tbo.base.vma_node,
+@@ -2039,6 +2046,18 @@ static struct ttm_bo_driver amdgpu_bo_driver = {
+ /*
+  * Firmware Reservation functions
+  */
++/**
++ * amdgpu_ttm_fim_reserve_vram_fini - free fw reserved vram
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * free fim reserved vram if it has been reserved.
++ */
++static void amdgpu_ttm_fim_reserve_vram_fini(struct amdgpu_device *adev)
++{
++        amdgpu_bo_free_kernel(&adev->fim_memory, NULL, NULL);
++}
++
+ /**
+  * amdgpu_ttm_fw_reserve_vram_fini - free fw reserved vram
+  *
+@@ -2052,6 +2071,49 @@ static void amdgpu_ttm_fw_reserve_vram_fini(struct amdgpu_device *adev)
+ 		NULL, &adev->mman.fw_vram_usage_va);
+ }
+ 
++/**
++ * amdgpu_ttm_fim_reserve_vram_init - create bo vram reservation for fim
++ *
++ * @adev: amdgpu_device pointer
++ *
++ * create bo vram reservation from fim.
++ */
++static int amdgpu_ttm_fim_reserve_vram_init(struct amdgpu_device *adev)
++{
++        uint64_t fim_size;
++        uint64_t fw_size = 16 << 20;
++
++        if (amdgpu_fim_size == -1) {
++                fim_size = (adev->gmc.visible_vram_size + fw_size) / 2;
++        } else if (amdgpu_fim_size > 0) {
++                /* Leave at least 64MB visible VRAM. This means FIM
++                 * is only going to be a useful size on large-BAR cards.
++                 */
++                fim_size = (adev->gmc.visible_vram_size + fw_size) / 2;
++
++                if ((uint64_t)amdgpu_fim_size << 20 > fim_size)
++                        pr_err("FIM size doesn't leave enough visible VRAM. Adjusting to %lluMB\n",
++                               fim_size >> 20);
++                else
++                        fim_size = (uint64_t)amdgpu_fim_size << 20;
++
++                if (fim_size > adev->mman.fw_vram_usage_start_offset) {
++                        pr_err("FIM size conflicts with FW reservation. Adjusting to %lluMB\n",
++                               adev->mman.fw_vram_usage_start_offset >> 20);
++                        fim_size = adev->mman.fw_vram_usage_start_offset;
++                }
++        } else {
++                return 0;
++        }
++
++        return amdgpu_bo_create_device_at(adev,
++					  0,
++					  fim_size,
++					  AMDGPU_GEM_DOMAIN_VRAM,
++					  &adev->fim_memory,
++					  NULL);
++}
++
+ /**
+  * amdgpu_ttm_fw_reserve_vram_init - create bo vram reservation from fw
+  *
+@@ -2427,6 +2489,11 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
+ 		return r;
+ 	}
+ 
++        r = amdgpu_ttm_fim_reserve_vram_init(adev);
++        if (r) {
++                return r;
++        }
++
+ 	/*
+ 	 * only NAVI10 and onwards ASIC support for IP discovery.
+ 	 * If IP discovery enabled, a block of memory should be
+@@ -2531,6 +2598,7 @@ void amdgpu_ttm_fini(struct amdgpu_device *adev)
+ 		return;
+ 
+ 	amdgpu_ttm_training_reserve_vram_fini(adev);
++        amdgpu_ttm_fim_reserve_vram_fini(adev);
+ 	/* return the stolen vga memory back to VRAM */
+ 	if (adev->mman.keep_stolen_vga_memory)
+ 		amdgpu_bo_free_kernel(&adev->mman.stolen_vga_memory, NULL, NULL);
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index 3f37d533b454..97a3585797c2 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -1339,6 +1339,11 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
+ 		goto err_unlock;
+ 	}
+ 
++        if (flags & KFD_IOC_ALLOC_MEM_FLAGS_FIM)
++                err = amdgpu_amdkfd_gpuvm_import_fim(
++                        dev->kgd, args->va_addr, args->size,
++                        pdd->vm, (struct kgd_mem **) &mem, &offset);
++        else
+ 	err = amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
+ 		dev->kgd, args->va_addr, args->size,
+ 		pdd->vm, NULL, (struct kgd_mem **) &mem, &offset,
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_crat.c b/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+index c5eaa301fcb7..bde5cde51b6c 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+@@ -1282,6 +1282,25 @@ static int kfd_create_vcrat_image_gpu(void *pcrat_image,
+ 	crat_table->length += sizeof(struct crat_subtype_memory);
+ 	crat_table->total_entries++;
+ 
++        /* Add FIM heap if applicable */
++        if (local_mem_info.local_mem_size_fim) {
++                sub_type_hdr = (typeof(sub_type_hdr))((char *)sub_type_hdr +
++                                                      sub_type_hdr->length);
++
++                ret = kfd_fill_gpu_memory_affinity(&avail_size,
++                                kdev, HSA_MEM_HEAP_TYPE_FIM,
++                                local_mem_info.local_mem_size_fim,
++                                (struct crat_subtype_memory *)sub_type_hdr,
++                                proximity_domain,
++                                &local_mem_info);
++
++                if (ret < 0)
++                        return ret;
++
++                crat_table->length += sizeof(struct crat_subtype_memory);
++                crat_table->total_entries++;
++        }
++
+ 	/* TODO: Fill in cache information. This information is NOT readily
+ 	 * available in KGD
+ 	 */
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_topology.h b/drivers/gpu/drm/amd/amdkfd/kfd_topology.h
+index a0d02fa3339a..b914df37d026 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_topology.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_topology.h
+@@ -105,6 +105,9 @@ struct kfd_node_properties {
+ #define HSA_MEM_HEAP_TYPE_GPU_GDS	3
+ #define HSA_MEM_HEAP_TYPE_GPU_LDS	4
+ #define HSA_MEM_HEAP_TYPE_GPU_SCRATCH	5
++#define HSA_MEM_HEAP_TYPE_SVM           6 /* reserved for user mode */
++#define HSA_MEM_HEAP_TYPE_MMIO_REMAP    7 /* reserved for user mode */
++#define HSA_MEM_HEAP_TYPE_FIM           8
+ 
+ #define HSA_MEM_FLAGS_HOT_PLUGGABLE	0x00000001
+ #define HSA_MEM_FLAGS_NON_VOLATILE	0x00000002
+diff --git a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+index d42f99ca08b2..3ff91d6e14b7 100644
+--- a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+@@ -79,6 +79,7 @@ struct kfd_cu_info {
+ struct kfd_local_mem_info {
+ 	uint64_t local_mem_size_private;
+ 	uint64_t local_mem_size_public;
++        uint64_t local_mem_size_fim;
+ 	uint32_t vram_width;
+ 	uint32_t mem_clk_max;
+ };
+diff --git a/include/uapi/linux/kfd_ioctl.h b/include/uapi/linux/kfd_ioctl.h
+index 2d2a651d9bac..5d4df1179bc6 100644
+--- a/include/uapi/linux/kfd_ioctl.h
++++ b/include/uapi/linux/kfd_ioctl.h
+@@ -534,6 +534,7 @@ struct kfd_ioctl_acquire_vm_args {
+ #define KFD_IOC_ALLOC_MEM_FLAGS_USERPTR		(1 << 2)
+ #define KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL	(1 << 3)
+ #define KFD_IOC_ALLOC_MEM_FLAGS_MMIO_REMAP	(1 << 4)
++#define KFD_IOC_ALLOC_MEM_FLAGS_FIM             (1 << 5)
+ /* Allocation flags: attributes/access options */
+ #define KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE	(1 << 31)
+ #define KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE	(1 << 30)
+-- 
+2.25.1
+

@@ -1,0 +1,223 @@
+From 6ad7de99cf11c9abe64dff58a6eb72df29033efb Mon Sep 17 00:00:00 2001
+From: Sudhakar M K <sudhakar.mk@samsung.com>
+Date: Wed, 3 Feb 2021 04:10:29 +0000
+Subject: [PATCH] Get reserved PIM Area to user as block
+
+This commit gets FIM reserved memory from kernel to user
+
+Signed-off-by: Sudhakar M K <sudhakar.mk@samsung.com>
+---
+ include/hsakmttypes.h     |  1 +
+ include/linux/kfd_ioctl.h |  1 +
+ src/fmm.c                 | 86 +++++++++++++++++++++++++++++++++++----
+ src/fmm.h                 |  2 +
+ src/libhsakmt.ver         |  3 +-
+ src/topology.c            |  3 +-
+ 6 files changed, 87 insertions(+), 9 deletions(-)
+
+diff --git a/include/hsakmttypes.h b/include/hsakmttypes.h
+index ef97539..e6bad55 100644
+--- a/include/hsakmttypes.h
++++ b/include/hsakmttypes.h
+@@ -326,6 +326,7 @@ typedef enum _HSA_HEAPTYPE
+     HSA_HEAPTYPE_GPU_SCRATCH           = 5, // GPU special memory (scratch)
+     HSA_HEAPTYPE_DEVICE_SVM            = 6, // sys-memory mapped by device page tables
+     HSA_HEAPTYPE_MMIO_REMAP            = 7, // remapped mmio, such as hdp flush registers
++    HSA_HEAPTYPE_FIM                   = 8, // FIM
+ 
+     HSA_HEAPTYPE_NUMHEAPTYPES,
+     HSA_HEAPTYPE_SIZE                  = 0xFFFFFFFF
+diff --git a/include/linux/kfd_ioctl.h b/include/linux/kfd_ioctl.h
+index 6a7dd1f..c546e7b 100644
+--- a/include/linux/kfd_ioctl.h
++++ b/include/linux/kfd_ioctl.h
+@@ -472,6 +472,7 @@ struct kfd_ioctl_acquire_vm_args {
+ #define KFD_IOC_ALLOC_MEM_FLAGS_USERPTR		(1 << 2)
+ #define KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL	(1 << 3)
+ #define KFD_IOC_ALLOC_MEM_FLAGS_MMIO_REMAP	(1 << 4)
++#define KFD_IOC_ALLOC_MEM_FLAGS_FIM		(1 << 5)
+ /* Allocation flags: attributes/access options */
+ #define KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE	(1 << 31)
+ #define KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE	(1 << 30)
+diff --git a/src/fmm.c b/src/fmm.c
+index d3f2897..c04de60 100644
+--- a/src/fmm.c
++++ b/src/fmm.c
+@@ -177,6 +177,7 @@ typedef struct {
+ 	aperture_t lds_aperture;
+ 	aperture_t scratch_aperture;
+ 	aperture_t mmio_aperture;
++	aperture_t pim_aperture;
+ 	manageable_aperture_t scratch_physical; /* For dGPU, scratch physical is allocated from
+ 						 * dgpu_aperture. When requested by RT, each
+ 						 * GPU will get a differnt range
+@@ -2053,6 +2054,72 @@ static void fmm_init_rbtree(void)
+ 	}
+ }
+ 
++HSAuint64 HSAKMTAPI fmm_map_pim(HSAuint32 node_id, HSAuint32 gpu_id, HSAuint64 size)
++{
++	void *mem;
++	manageable_aperture_t *aperture = svm.dgpu_alt_aperture;
++	uint32_t ioc_flags;
++	vm_object_t *vm_obj = NULL;
++	HsaMemFlags flags;
++	void *ret;
++	uint64_t mmap_offset;
++	int32_t gpu_mem_id = gpu_mem_find_by_gpu_id(gpu_id);
++
++	if (gpu_mem_id < 0) {
++		pr_err("gpu_mem_id not found\n");
++		return 0;
++	}
++	if (gpu_mem[gpu_mem_id].pim_aperture.base) {
++		pr_info("PIM already mapped at %p\n", gpu_mem[gpu_mem_id].pim_aperture.base);
++		return (HSAuint64)gpu_mem[gpu_mem_id].pim_aperture.base;
++	}
++
++	ioc_flags = KFD_IOC_ALLOC_MEM_FLAGS_FIM |
++		KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
++		KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
++	mem = __fmm_allocate_device(gpu_id, NULL, size, aperture,
++			&mmap_offset, ioc_flags, &vm_obj);
++
++	if (!mem || !vm_obj) {
++		pr_err("PIM allocation failed\n");
++		return 0;
++	}
++
++	flags.Value = 0;
++	flags.ui32.NonPaged = 1;
++	flags.ui32.HostAccess = 1;
++	flags.ui32.Reserved = 0;
++	pthread_mutex_lock(&aperture->fmm_mutex);
++	vm_obj->flags = flags.Value;
++	vm_obj->node_id = node_id;
++	pthread_mutex_unlock(&aperture->fmm_mutex);
++
++	/* Map for CPU access*/
++	ret = mmap(mem, size,
++			 PROT_READ | PROT_WRITE,
++			 MAP_SHARED | MAP_FIXED,
++			 gpu_mem[gpu_mem_id].drm_render_fd,
++			 mmap_offset);
++	if (ret == MAP_FAILED) {
++		__fmm_release(vm_obj, aperture);
++		printf("PIM mmap failed (offset=%lx)\n", mmap_offset);
++		return 0;
++	}
++
++	/* Map for GPU access*/
++	if (fmm_map_to_gpu(mem, size, NULL)) {
++		__fmm_release(vm_obj, aperture);
++		printf("PIM map to GPU failed\n");
++		return 0;
++	}
++
++	gpu_mem[gpu_mem_id].pim_aperture.base = mem;
++	gpu_mem[gpu_mem_id].pim_aperture.limit = VOID_PTR_ADD(mem, size-1);
++	printf ("Mapped %luMB PIM at %p\n", size >> 20, mem);
++
++	return (HSAuint64)mem;
++}
++
+ static void *map_mmio(uint32_t node_id, uint32_t gpu_id, int mmap_fd)
+ {
+ 	void *mem;
+@@ -2101,16 +2168,21 @@ static void *map_mmio(uint32_t node_id, uint32_t gpu_id, int mmap_fd)
+ 	return mem;
+ }
+ 
+-static void release_mmio(void)
++static void release_mmio_pim(void)
+ {
+ 	uint32_t gpu_mem_id;
+ 
+ 	for (gpu_mem_id = 0; (uint32_t)gpu_mem_id < gpu_mem_count; gpu_mem_id++) {
+-		if (!gpu_mem[gpu_mem_id].mmio_aperture.base)
+-			continue;
+-		fmm_unmap_from_gpu(gpu_mem[gpu_mem_id].mmio_aperture.base);
+-		munmap(gpu_mem[gpu_mem_id].mmio_aperture.base, PAGE_SIZE);
+-		fmm_release(gpu_mem[gpu_mem_id].mmio_aperture.base);
++		if (gpu_mem[gpu_mem_id].mmio_aperture.base) {
++			fmm_unmap_from_gpu(gpu_mem[gpu_mem_id].mmio_aperture.base);
++			fmm_release(gpu_mem[gpu_mem_id].mmio_aperture.base);
++			gpu_mem[gpu_mem_id].mmio_aperture.base = NULL;
++		}
++		if (gpu_mem[gpu_mem_id].pim_aperture.base) {
++			fmm_unmap_from_gpu(gpu_mem[gpu_mem_id].mmio_aperture.base);
++			fmm_release(gpu_mem[gpu_mem_id].mmio_aperture.base);
++			gpu_mem[gpu_mem_id].pim_aperture.base = NULL;
++		}
+ 	}
+ }
+ 
+@@ -2395,7 +2467,7 @@ sysfs_parse_failed:
+ 
+ void fmm_destroy_process_apertures(void)
+ {
+-	release_mmio();
++	release_mmio_pim();
+ 	if (gpu_mem) {
+ 		free(gpu_mem);
+ 		gpu_mem = NULL;
+diff --git a/src/fmm.h b/src/fmm.h
+index e06acfd..a314db4 100644
+--- a/src/fmm.h
++++ b/src/fmm.h
+@@ -36,6 +36,7 @@ typedef enum {
+ 	FMM_SCRATCH,
+ 	FMM_SVM,
+ 	FMM_MMIO,
++	FMM_PIM,
+ 	FMM_LAST_APERTURE_TYPE
+ } aperture_type_e;
+ 
+@@ -67,6 +68,7 @@ HSAKMT_STATUS fmm_node_added(HSAuint32 gpu_id);
+ HSAKMT_STATUS fmm_node_removed(HSAuint32 gpu_id);
+ HSAKMT_STATUS fmm_get_aperture_base_and_limit(aperture_type_e aperture_type, HSAuint32 gpu_id,
+ 		HSAuint64 *aperture_base, HSAuint64 *aperture_limit);
++HSAuint64 fmm_map_pim(HSAuint32 node_id, HSAuint32 gpu_id, HSAuint64 size);
+ 
+ HSAKMT_STATUS fmm_register_memory(void *address, uint64_t size_in_bytes,
+ 								  uint32_t *gpu_id_array,
+diff --git a/src/libhsakmt.ver b/src/libhsakmt.ver
+index d47f68d..607b6b8 100644
+--- a/src/libhsakmt.ver
++++ b/src/libhsakmt.ver
+@@ -69,9 +69,10 @@ hsaKmtQueueResume;
+ hsaKmtAllocQueueGWS;
+ hsaKmtGetKernelDebugTrapVersionInfo;
+ hsaKmtGetThunkDebugTrapVersionInfo;
++fmm_map_fim;
+ hsaKmtSetAddressWatch;
+ hsaKmtClearAddressWatch;
++fmm_map_pim;
+ 
+ local: *;
+ };
+-
+diff --git a/src/topology.c b/src/topology.c
+index 36ef987..9bbf2c9 100644
+--- a/src/topology.c
++++ b/src/topology.c
+@@ -1089,6 +1089,7 @@ err:
+ }
+ 
+ static HSAKMT_STATUS topology_sysfs_get_mem_props(uint32_t node_id,
++						  uint32_t gpu_id,
+ 						  uint32_t mem_id,
+ 						  HsaMemoryProperties *props)
+ {
+@@ -1777,7 +1778,7 @@ retry:
+ 					goto err;
+ 				}
+ 				for (mem_id = 0; mem_id < temp_props[i].node.NumMemoryBanks; mem_id++) {
+-					ret = topology_sysfs_get_mem_props(i, mem_id, &temp_props[i].mem[mem_id]);
++					ret = topology_sysfs_get_mem_props(i, temp_props[i].gpu_id, mem_id, &temp_props[i].mem[mem_id]);
+ 					if (ret != HSAKMT_STATUS_SUCCESS) {
+ 						free_properties(temp_props, i + 1);
+ 						goto err;
+-- 
+2.17.1
+

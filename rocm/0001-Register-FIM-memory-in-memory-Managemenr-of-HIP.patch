@@ -1,0 +1,68 @@
+From 4251ac67487c300bc860e0f8ad31ec615e7001d3 Mon Sep 17 00:00:00 2001
+From: Sudhakar M K <sudhakar.mk@samsung.com>
+Date: Mon, 22 Mar 2021 08:31:43 +0000
+Subject: [PATCH] Register FIM memory in memory Managemenr of HIP
+
+This commit registers the FIM memory reserved during bootup to HIP
+memory
+
+Signed-off-by: Sudhakar M K <sudhakar.mk@samsung.com>
+---
+ include/hip/hcc_detail/hip_runtime_api.h |  1 +
+ rocclr/hip_memory.cpp                    | 15 ++++++++++++---
+ 2 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/include/hip/hcc_detail/hip_runtime_api.h b/include/hip/hcc_detail/hip_runtime_api.h
+index e09de31d..94712e74 100755
+--- a/include/hip/hcc_detail/hip_runtime_api.h
++++ b/include/hip/hcc_detail/hip_runtime_api.h
+@@ -204,6 +204,7 @@ enum hipLimit_t {
+          ///< can be obtained with #hipHostGetDevicePointer.
+ #define hipHostRegisterIoMemory 0x4  ///< Not supported.
+ #define hipExtHostRegisterCoarseGrained 0x8  ///< Coarse Grained host memory lock
++#define hipRegisterExternalSvm 0x10  ///< Hack for FIM
+ 
+ #define hipDeviceScheduleAuto 0x0  ///< Automatically select between Spin and Yield
+ #define hipDeviceScheduleSpin                                                                      \
+diff --git a/rocclr/hip_memory.cpp b/rocclr/hip_memory.cpp
+index 75f9fe34..e3ab41fc 100755
+--- a/rocclr/hip_memory.cpp
++++ b/rocclr/hip_memory.cpp
+@@ -701,7 +701,17 @@ hipError_t hipHostGetFlags(unsigned int* flagsPtr, void* hostPtr) {
+ hipError_t hipHostRegister(void* hostPtr, size_t sizeBytes, unsigned int flags) {
+   HIP_INIT_API(hipHostRegister, hostPtr, sizeBytes, flags);
+   if(hostPtr != nullptr) {
+-    amd::Memory* mem = new (*hip::host_device->asContext()) amd::Buffer(*hip::host_device->asContext(), CL_MEM_USE_HOST_PTR | CL_MEM_SVM_ATOMICS, sizeBytes);
++    amd::Memory* mem;
++    if (flags & hipRegisterExternalSvm) {
++      mem = new (*hip::getCurrentDevice()->asContext()) amd::Buffer(*hip::getCurrentDevice()->asContext(), 0, sizeBytes, hostPtr);
++      if (!mem->create(nullptr)) {
++	mem->release();
++	DevLogPrintfError("Cannot create memory for size: %u with flags: %d \n",
++			  sizeBytes, flags);
++	HIP_RETURN(hipErrorOutOfMemory);
++      }
++    } else {
++      mem = new (*hip::host_device->asContext()) amd::Buffer(*hip::host_device->asContext(), CL_MEM_USE_HOST_PTR | CL_MEM_SVM_ATOMICS, sizeBytes);
+ 
+     constexpr bool sysMemAlloc = false;
+     constexpr bool skipAlloc = false;
+@@ -712,14 +722,13 @@ hipError_t hipHostRegister(void* hostPtr, size_t sizeBytes, unsigned int flags)
+                         sizeBytes, flags);
+       HIP_RETURN(hipErrorOutOfMemory);
+     }
+-
+     for (const auto& device: hip::getCurrentDevice()->devices()) {
+       // Since the amd::Memory object is shared between all devices
+       // it's fine to have multiple addresses mapped to it
+       const device::Memory* devMem = mem->getDeviceMemory(*device);
+       amd::MemObjMap::AddMemObj(reinterpret_cast<void*>(devMem->virtualAddress()), mem);
+     }
+-
++    }
+     amd::MemObjMap::AddMemObj(hostPtr, mem);
+     HIP_RETURN(hipSuccess);
+   } else {
+-- 
+2.17.1
+
