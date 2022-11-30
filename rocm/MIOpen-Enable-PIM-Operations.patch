@@ -1,0 +1,758 @@
+diff --git a/driver/CMakeLists.txt b/driver/CMakeLists.txt
+index 700eff70..de51d6ca 100644
+--- a/driver/CMakeLists.txt
++++ b/driver/CMakeLists.txt
+@@ -27,8 +27,11 @@ cmake_minimum_required( VERSION 3.5)
+ 
+ find_package(Threads REQUIRED)
+ 
++include_directories(/opt/rocm/include)
++link_directories(/opt/rocm/lib)
++
+ add_executable(MIOpenDriver main.cpp InputFlags.cpp)
+-target_link_libraries(MIOpenDriver MIOpen)
++target_link_libraries(MIOpenDriver MIOpen PimRuntime)
+ target_link_libraries(MIOpenDriver ${CMAKE_THREAD_LIBS_INIT})
+ # Cmake does not add flags correctly for gcc
+ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU") 
+diff --git a/driver/driver.hpp b/driver/driver.hpp
+index 35ebcc7a..297686f7 100644
+--- a/driver/driver.hpp
++++ b/driver/driver.hpp
+@@ -148,7 +148,7 @@ std::string ParseBaseArg(int argc, char* argv[])
+        arg != "CBAInfer" && arg != "CBAInferfp16" && arg != "pool" && arg != "poolfp16" &&
+        arg != "lrn" && arg != "lrnfp16" && arg != "activ" && arg != "activfp16" &&
+        arg != "softmax" && arg != "softmaxfp16" && arg != "bnorm" && arg != "bnormfp16" &&
+-       arg != "rnn" && arg != "rnnfp16" && arg != "gemm" /*&& arg != "gemmfp16"*/ && arg != "ctc" &&
++       arg != "rnn" && arg != "rnnfp16" && arg != "gemm" && arg != "gemmfp16" && arg != "ctc" &&
+        arg != "dropout" && arg != "dropoutfp16" && arg != "tensorop" && arg != "tensoropfp16" &&
+        arg != "reduce" && arg != "reducefp16" && arg != "--version")
+     {
+diff --git a/driver/gemm_driver.hpp b/driver/gemm_driver.hpp
+index fea0bbcd..261a0c81 100644
+--- a/driver/gemm_driver.hpp
++++ b/driver/gemm_driver.hpp
+@@ -105,7 +105,9 @@ template <typename T>
+ class GemmDriver : public Driver
+ {
+     public:
+-    GemmDriver() : Driver() {}
++    GemmDriver() : Driver() {
++        InitDataType<T>();
++    }
+ 
+     int AddCmdLineArgs();
+     int ParseCmdLineArgs(int argc, char* argv[]);
+@@ -179,6 +181,7 @@ int GemmDriver<T>::ParseCmdLineArgs(int argc, char* argv[])
+ template <typename T>
+ int GemmDriver<T>::GetandSetData()
+ {
++    gemm_desc.dataType = data_type;
+     gemm_desc.isColMajor = inflags.GetValueInt("isColMajor");
+     gemm_desc.m          = inflags.GetValueInt("a_h");
+     gemm_desc.k          = inflags.GetValueInt("a_w");
+@@ -231,7 +234,7 @@ int GemmDriver<T>::AllocateBuffersAndCopy()
+ #if GEMM_DRIVER_DEBUG
+     c = std::vector<T>(c_sz, 1.);
+ #else
+-    c                 = std::vector<T>(c_sz, 0.);
++    c                 = std::vector<T>(c_sz);
+ #endif
+     chost = c;
+ 
+@@ -270,8 +273,6 @@ int GemmDriver<T>::AllocateBuffersAndCopy()
+ template <typename T>
+ int GemmDriver<T>::RunForwardGPU()
+ {
+-    for(int i = 0; i < inflags.GetValueInt("iter"); i++)
+-    {
+ #if GEMM_DRIVER_DEBUG
+         {
+             std::cout << std::endl;
+@@ -313,17 +314,112 @@ int GemmDriver<T>::RunForwardGPU()
+                                    0,
+                                    nullptr,
+                                    false);
+-        else
+-            CallGemm(miopen::deref(GetHandle()),
+-                     gemm_desc,
+-                     a_dev->GetMem(),
+-                     0,
+-                     b_dev->GetMem(),
+-                     0,
+-                     c_dev->GetMem(),
+-                     0,
+-                     nullptr,
+-                     false);
++        else{
++	    char env_p, *ptr;
++
++            if(std::getenv("ENABLE_PIM"))
++            {
++                ptr = std::getenv("ENABLE_PIM");
++                env_p = *ptr;
++            }
++            else
++                env_p = '0';
++
++	    if(env_p == '1')
++            {
++		std::cout << "calling PIM gemv " << std::endl;
++
++	        float mS = 0;
++		hipEvent_t start, stop;
++		hipEventCreate(&start);
++		hipEventCreate(&stop);
++	        hipEventRecord(start, miopen::deref(GetHandle()).GetStream());
++
++                PimGemm(miopen::deref(GetHandle()),
++                        gemm_desc,
++                        a_dev->GetMem(),
++                        0,
++                        b_dev->GetMem(),
++                        0,
++                        c_dev->GetMem(),
++                        0);
++
++                hipEventRecord(stop, miopen::deref(GetHandle()).GetStream());
++	        hipEventSynchronize(stop);
++	        hipEventElapsedTime(&mS, start, stop);
++
++		hipEventCreate(&start);
++		hipEventCreate(&stop);
++	        hipEventRecord(start, miopen::deref(GetHandle()).GetStream());
++
++                for(int i = 0; i < inflags.GetValueInt("iter"); i++)
++                {
++                    PimGemm(miopen::deref(GetHandle()),
++                                gemm_desc,
++                                a_dev->GetMem(),
++                                0,
++                                b_dev->GetMem(),
++                                0,
++                                c_dev->GetMem(),
++                                0);
++                }
++
++                hipEventRecord(stop, miopen::deref(GetHandle()).GetStream());
++	        hipEventSynchronize(stop);
++	        hipEventElapsedTime(&mS, start, stop);
++
++		std::cout << mS/inflags.GetValueInt("iter") << std::endl;
++
++            }
++	    else{
++		std::cout << "calling GPU gemv " << std::endl;
++
++		hipEvent_t start, stop;
++	        float mS = 0;
++
++
++		hipEventCreate(&start);
++		hipEventCreate(&stop);
++	        hipEventRecord(start, miopen::deref(GetHandle()).GetStream());
++
++                CallGemm(miopen::deref(GetHandle()),
++                         gemm_desc,
++                         a_dev->GetMem(),
++                         0,
++                         b_dev->GetMem(),
++                         0,
++                         c_dev->GetMem(),
++                         0,
++                         nullptr,
++                         false);
++                hipEventRecord(stop, miopen::deref(GetHandle()).GetStream());
++	        hipEventSynchronize(stop);
++	        hipEventElapsedTime(&mS, start, stop);
++
++		hipEventCreate(&start);
++		hipEventCreate(&stop);
++	        hipEventRecord(start, miopen::deref(GetHandle()).GetStream());
++
++                for(int i = 0; i < inflags.GetValueInt("iter"); i++)
++                {
++                    CallGemm(miopen::deref(GetHandle()),
++                               gemm_desc,
++                               a_dev->GetMem(),
++                               0,
++                               b_dev->GetMem(),
++                               0,
++                               c_dev->GetMem(),
++                               0,
++                               nullptr,
++                               false);
++                }
++
++                hipEventRecord(stop, miopen::deref(GetHandle()).GetStream());
++	        hipEventSynchronize(stop);
++	        hipEventElapsedTime(&mS, start, stop);
++		std::cout << mS/inflags.GetValueInt("iter") << std::endl;
++	     }
++	}
+ #endif
+ 
+ #if GEMM_DRIVER_DEBUG
+@@ -343,7 +439,6 @@ int GemmDriver<T>::RunForwardGPU()
+             std::cout << __func__ << ": after_GEMM, c_tmp: " << c_tmp << std::endl;
+         }
+ #endif
+-    }
+ 
+     if(inflags.GetValueInt("time") == 1)
+     {
+diff --git a/driver/main.cpp b/driver/main.cpp
+index 5d876d0f..05699d4b 100644
+--- a/driver/main.cpp
++++ b/driver/main.cpp
+@@ -44,7 +44,6 @@
+ 
+ int main(int argc, char* argv[])
+ {
+-
+     std::string base_arg = ParseBaseArg(argc, argv);
+ 
+     if(base_arg == "--version")
+@@ -125,10 +124,10 @@ int main(int argc, char* argv[])
+         drv = new GemmDriver<float>();
+     }
+ // TODO half is not supported in gemm
+-//    else if(base_arg == "gemmfp16")
+-//    {
+-//        drv = new GemmDriver<float16>();
+-//    }
++    else if(base_arg == "gemmfp16")
++    {
++        drv = new GemmDriver<float16>();
++    }
+ #endif
+     else if(base_arg == "bnorm")
+     {
+@@ -202,6 +201,8 @@ int main(int argc, char* argv[])
+     bool verifyarg    = (drv->GetInputFlags().GetValueInt("verify") == 1);
+     int cumulative_rc = 0; // Do not stop running tests in case of errors.
+ 
++    PimInitialize(RT_TYPE_HIP, PIM_FP16);
++
+     if(fargval & 1 || fargval == 0 || bnFwdInVer)
+     {
+         rc = drv->RunForwardGPU();
+@@ -224,5 +225,7 @@ int main(int argc, char* argv[])
+             cumulative_rc |= drv->VerifyBackward();
+     }
+ 
++    PimDeinitialize();
++
+     return cumulative_rc;
+ }
+diff --git a/driver/rnn_driver.hpp b/driver/rnn_driver.hpp
+index 65de51d6..4dc1b084 100644
+--- a/driver/rnn_driver.hpp
++++ b/driver/rnn_driver.hpp
+@@ -26,6 +26,7 @@
+ #ifndef GUARD_MIOPEN_RNN_DRIVER_HPP
+ #define GUARD_MIOPEN_RNN_DRIVER_HPP
+ 
++#include "hip/hip_runtime.h"
+ #include "InputFlags.hpp"
+ #include "rnn_verify_gemm.hpp"
+ #include "lstm_verify_gemm.hpp"
+@@ -804,6 +805,7 @@ int RNNDriver<Tgpu, Tref>::RunForwardGPU()
+         }
+ 
+         START_TIME
++        //PIM_PROFILE_TICK(LSTM_E2E);
+         if(inflags.GetValueInt("fwdtype") == 0)
+         {
+             miopenRNNForwardTraining(GetHandle(),
+@@ -856,6 +858,8 @@ int RNNDriver<Tgpu, Tref>::RunForwardGPU()
+                                       workspace_dev->GetSize());
+         }
+         miopen::deref(GetHandle()).Finish();
++        //hipStreamSynchronize(NULL);
++        //PIM_PROFILE_TOCK(LSTM_E2E);
+         STOP_TIME
+ 
+         if(i > 0 || inflags.GetValueInt("iter") == 1)
+diff --git a/driver/tensorop_driver.hpp b/driver/tensorop_driver.hpp
+index 0ca1189b..cc5c8b04 100644
+--- a/driver/tensorop_driver.hpp
++++ b/driver/tensorop_driver.hpp
+@@ -50,7 +50,8 @@ class TensorOpDriver : public Driver
+         miopenCreateTensorDescriptor(&bTensor);
+         miopenCreateTensorDescriptor(&cTensor);
+         // TODO: check the dataype
+-        data_type = miopenFloat;
++//        data_type = miopenFloat;
++        data_type = miopenHalf;
+         op        = miopenTensorOpAdd;
+         is_set    = false;
+         is_scale  = false;
+@@ -268,45 +269,121 @@ int TensorOpDriver<Tgpu, Tref>::RunForwardGPU()
+     float min_time  = 100000000.0f;
+ 
+     Timer t;
++    char env_p, *ptr;
+ 
+-    for(int i = 0; i < iters; ++i)
++    if(std::getenv("ENABLE_PIM"))
+     {
+-        START_TIME
+-
+-        if(!is_set && !is_scale)
+-            miopenOpTensor(GetHandle(),
+-                           op,
+-                           &falpha1,
+-                           aTensor,
+-                           a_dev->GetMem(),
+-                           &falpha2,
+-                           bTensor,
+-                           b_dev->GetMem(),
+-                           &fbeta,
+-                           cTensor,
+-                           c_dev->GetMem());
+-        else if(is_set)
+-            miopenSetTensor(GetHandle(), aTensor, a_dev->GetMem(), &ftensor_val);
+-        else if(is_scale)
+-            miopenScaleTensor(GetHandle(), aTensor, a_dev->GetMem(), &ftensor_val);
+-
+-        miopen::deref(GetHandle()).Finish();
++        ptr = std::getenv("ENABLE_PIM");
++        env_p = *ptr;
++    }
++    else
++        env_p = '0';
+ 
+-        STOP_TIME
+-        if(WALL_CLOCK)
++    if(env_p == '1')
++    {
++        printf("PIM Mode is Enabled\n");
++        size_t size = GetTensorSize(aTensor);
++        PimBo* gpu_input0 = PimCreateBo(size, 1, 1, 1, PIM_FP16, MEM_TYPE_DEVICE, a_dev->GetMem());
++        PimBo* gpu_input1 = PimCreateBo(size, 1, 1, 1, PIM_FP16, MEM_TYPE_DEVICE, b_dev->GetMem());
++        PimBo* gpu_output = PimCreateBo(size, 1, 1, 1, PIM_FP16, MEM_TYPE_DEVICE, c_dev->GetMem());
++        PimBo* pim_input0 = PimCreateBo(size, 1, 1, 1, PIM_FP16, MEM_TYPE_PIM);
++        PimBo* pim_input1 = PimCreateBo(size, 1, 1, 1, PIM_FP16, MEM_TYPE_PIM);
++        PimBo* pim_output = PimCreateBo(size, 1, 1, 1, PIM_FP16, MEM_TYPE_PIM);
++
++        PimCopyMemory(pim_input0, gpu_input0, DEVICE_TO_PIM);
++        PimCopyMemory(pim_input1, gpu_input1, DEVICE_TO_PIM);
++
++        hipEvent_t start, stop;
++        hipEventCreate(&start);
++        hipEventCreate(&stop);
++        float time = 0.0f;
++
++        for(int i = 0; i < iters; ++i)
+         {
+-            if(iters > 1)
+-                fulltime += t.gettime_ms();
+-            else if(iters == 1)
+-                fulltime = t.gettime_ms();
++            START_TIME
++
++            hipEventRecord(start, miopen::deref(GetHandle()).GetStream());
++            if(!is_set && !is_scale)
++                PimOpTensor(GetHandle(),
++                            op,
++                            pim_input0,
++                            pim_input1,
++                            pim_output);
++            else if(is_set)
++                miopenSetTensor(GetHandle(), aTensor, a_dev->GetMem(), &ftensor_val);
++            else if(is_scale)
++                miopenScaleTensor(GetHandle(), aTensor, a_dev->GetMem(), &ftensor_val);
++
++            hipEventRecord(stop, miopen::deref(GetHandle()).GetStream());
++            hipEventSynchronize(stop);
++            hipEventElapsedTime(&time, start, stop);
++
++            STOP_TIME
++            if(WALL_CLOCK)
++            {
++                if(iters > 1)
++                    fulltime += t.gettime_ms();
++                else if(iters == 1)
++                    fulltime = t.gettime_ms();
++            }
++            if(inflags.GetValueInt("time") == 1)
++            {
++                min_time = (time < min_time) ? time : min_time;
++                if(iters > 1)
++                   avgtime += time;
++            }
+         }
+-        if(inflags.GetValueInt("time") == 1)
++        PimCopyMemory(gpu_output, pim_output, PIM_TO_DEVICE);
++
++        PimDestroyBo(gpu_input0);
++        PimDestroyBo(gpu_input1);
++        PimDestroyBo(gpu_output);
++        PimDestroyBo(pim_input0);
++        PimDestroyBo(pim_input1);
++        PimDestroyBo(pim_output);
++    }
++    else
++    {
++        printf("GPU Mode is Enabled\n");
++        for(int i = 0; i < iters; ++i)
+         {
+-            float time = 0.0;
+-            miopenGetKernelTime(GetHandle(), &time);
+-            min_time = (time < min_time) ? time : min_time;
+-            if(iters > 1)
+-                avgtime += time;
++            START_TIME
++
++            if(!is_set && !is_scale)
++                miopenOpTensor(GetHandle(),
++                               op,
++                               &falpha1,
++                               aTensor,
++                               a_dev->GetMem(),
++                               &falpha2,
++                               bTensor,
++                               b_dev->GetMem(),
++                               &fbeta,
++                               cTensor,
++                               c_dev->GetMem());
++            else if(is_set)
++                miopenSetTensor(GetHandle(), aTensor, a_dev->GetMem(), &ftensor_val);
++            else if(is_scale)
++                miopenScaleTensor(GetHandle(), aTensor, a_dev->GetMem(), &ftensor_val);
++
++            miopen::deref(GetHandle()).Finish();
++
++            STOP_TIME
++            if(WALL_CLOCK)
++            {
++                if(iters > 1)
++                    fulltime += t.gettime_ms();
++                else if(iters == 1)
++                    fulltime = t.gettime_ms();
++            }
++            if(inflags.GetValueInt("time") == 1)
++            {
++                float time = 0.0;
++                miopenGetKernelTime(GetHandle(), &time);
++                min_time = (time < min_time) ? time : min_time;
++                if(iters > 1)
++                    avgtime += time;
++            }
+         }
+     }
+ 
+@@ -337,6 +414,7 @@ int TensorOpDriver<Tgpu, Tref>::RunForwardGPU()
+         c_dev->FromGPU(GetStream(), c.data());
+     else
+         a_dev->FromGPU(GetStream(), a.data());
++
+     return miopenStatusSuccess;
+ }
+ 
+diff --git a/include/miopen/miopen.h b/include/miopen/miopen.h
+index bd9ac3a2..d9fbeb0e 100644
+--- a/include/miopen/miopen.h
++++ b/include/miopen/miopen.h
+@@ -47,6 +47,8 @@
+ #include <hip/hip_runtime_api.h>
+ #endif
+ 
++#include "pim_runtime_api.h"
++
+ /*
+  * @defgroup convolutions
+  * @defgroup pooling
+@@ -644,6 +646,12 @@ MIOPEN_EXPORT miopenStatus_t miopenOpTensor(miopenHandle_t handle,
+                                             const miopenTensorDescriptor_t cDesc,
+                                             void* C);
+ 
++MIOPEN_EXPORT miopenStatus_t PimOpTensor(miopenHandle_t handle,
++                                         miopenTensorOp_t tensorOp,
++                                         PimBo* input0,
++                                         PimBo* input1,
++                                         PimBo* output);
++
+ /*! @brief Fills a tensor with a single value.
+  *
+  * Supported datatypes are fp32, fp16, and bfp16
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 1bd0a131..0c418bf9 100755
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -502,6 +502,7 @@ endif()
+ if(MIOPEN_USE_COMGR)
+     list(APPEND MIOpen_Source comgr.cpp)
+ endif()
++link_directories(/opt/rocm/lib)
+ 
+ # build library
+ add_library( MIOpen
+@@ -534,6 +535,7 @@ target_include_directories(MIOpen PUBLIC
+ target_include_directories(MIOpen SYSTEM PUBLIC $<BUILD_INTERFACE:${HALF_INCLUDE_DIR}>)
+ target_include_directories(MIOpen SYSTEM PRIVATE ${BZIP2_INCLUDE_DIR})
+ target_link_libraries(MIOpen PRIVATE ${CMAKE_THREAD_LIBS_INIT} ${BZIP2_LIBRARIES})
++
+ generate_export_header(MIOpen
+     EXPORT_FILE_NAME ${PROJECT_BINARY_DIR}/include/miopen/export.h
+ )
+@@ -577,6 +579,8 @@ if(rocblas_FOUND)
+     list(APPEND PACKAGE_STATIC_DEPENDS PACKAGE rocblas)
+ endif()
+ 
++target_link_libraries( MIOpen PRIVATE PimRuntime)
++
+ if(WIN32 AND NOT MSVC)
+     if(BUILD_DEV)
+         target_link_libraries(MIOpen PUBLIC -Wl,-export-all-symbols -Wl,-exclude-symbols=_Unwind_Resume)
+diff --git a/src/batch_norm_api.cpp b/src/batch_norm_api.cpp
+index 22cf7576..65986b9f 100644
+--- a/src/batch_norm_api.cpp
++++ b/src/batch_norm_api.cpp
+@@ -29,6 +29,7 @@
+ #include <miopen/logger.hpp>
+ #include <miopen/tensor.hpp>
+ #include <miopen/tensor_ops.hpp>
++#include <half.hpp>
+ 
+ #include <array>
+ #include <initializer_list>
+diff --git a/src/gemm_v2.cpp b/src/gemm_v2.cpp
+index 36e3e6e9..4c5f4453 100644
+--- a/src/gemm_v2.cpp
++++ b/src/gemm_v2.cpp
+@@ -29,6 +29,7 @@
+ #include <miopen/tensor.hpp>
+ #include <miopen/handle.hpp>
+ #include <miopen/finddb_kernel_cache_key.hpp>
++#include <miopen/float_equal.hpp>
+ 
+ #if MIOPEN_USE_ROCBLAS
+ #include <half.hpp>
+@@ -76,6 +77,7 @@ auto miopen_rocblas_gemm_strided_batched_ex(Ts... xs)
+ 
+ #endif // MIOPEN_USE_ROCBLAS
+ 
++MIOPEN_DECLARE_ENV_VAR(ENABLE_PIM)
+ MIOPEN_DECLARE_ENV_VAR(MIOPEN_GEMM_ENFORCE_BACKEND)
+ 
+ namespace miopen {
+@@ -310,6 +312,16 @@ miopenStatus_t CallGemmTimeMeasure(const Handle& handle,
+     return miopenStatusNotImplemented;
+ }
+ 
++bool is_gemv(GemmDescriptor gemm_desc)
++{
++    bool ret = false;
++
++    if (gemm_desc.m == 1 && gemm_desc.n != 1) return true;
++    if (gemm_desc.m != 1 && gemm_desc.n == 1) return true;
++
++    return ret;
++}
++
+ miopenStatus_t CallGemm(const Handle& handle,
+                         GemmDescriptor gemm_desc,
+                         ConstData_t A,
+@@ -328,6 +340,10 @@ miopenStatus_t CallGemm(const Handle& handle,
+ 
+     MIOPEN_LOG_I2("gemm_desc: " << gemm_desc);
+ 
++    if (Value(ENABLE_PIM{}) && is_gemv(gemm_desc)) {
++        return PimGemm(handle, gemm_desc, A, a_offset, B, b_offset, C, c_offset);
++    }
++
+     gemm_backend = enforce_gemm_backend(gemm_desc.dataType, gemm_backend);
+ 
+     // do row-to-column major conversion here
+@@ -1887,4 +1903,67 @@ GemmDescriptor CreateGemmDescriptorGroupConvCNHWBwdData(const TensorDescriptor&
+                           dxDesc.GetType()};
+ }
+ 
++miopenStatus_t PimGemm(const Handle& handle,
++                       GemmDescriptor gemm_desc,
++                       ConstData_t A,
++                       int a_offset,
++                       ConstData_t B,
++                       int b_offset,
++                       Data_t C,
++                       int c_offset)
++{
++    MIOPEN_LOG_I2("gemm_desc: " << gemm_desc);
++    if (gemm_desc.dataType == miopenFloat) {
++        std::cout << "[PimGemm] error! data type is float32" << std::endl;
++        return miopenStatusNotImplemented;
++    }
++
++    uint32_t out_size = 0;
++    uint32_t in_size = 0;
++    void* i_addr = nullptr;
++    void* w_addr = nullptr;
++    void* o_addr = nullptr;
++    bool transposed_input = false;
++    bool transposed_weight = false;
++
++    PimGemmOrder gemm_order = (gemm_desc.m == 1) ? I_X_W : W_X_I;
++    PimGemmDesc *pim_desc = nullptr;
++
++    if (gemm_order == I_X_W) {
++        i_addr = (void*)(reinterpret_cast<const half_float::half*>(A) + a_offset);
++        w_addr = (void*)(reinterpret_cast<const half_float::half*>(B) + b_offset);
++        o_addr = (void*)(reinterpret_cast<const half_float::half*>(C) + c_offset);
++        in_size = gemm_desc.k;
++        out_size = gemm_desc.n;
++        pim_desc = PimCreateGemmDesc(1, 1, 1, in_size, 1, out_size, PIM_FP16, gemm_order);
++        transposed_input = gemm_desc.transA;
++        transposed_weight = gemm_desc.transB;
++    } else {
++        w_addr = (void*)(reinterpret_cast<const half_float::half*>(A) + a_offset);
++        i_addr = (void*)(reinterpret_cast<const half_float::half*>(B) + b_offset);
++        o_addr = (void*)(reinterpret_cast<const half_float::half*>(C) + c_offset);
++        in_size = gemm_desc.k;
++        out_size = gemm_desc.m;
++        pim_desc = PimCreateGemmDesc(1, 1, in_size, 1, out_size, 1, PIM_FP16, gemm_order);
++        transposed_input = gemm_desc.transB;
++        transposed_weight = gemm_desc.transA;
++    }
++
++    PimBo *pim_input = PimCreateBo(pim_desc, MEM_TYPE_DEVICE, GEMM_INPUT, i_addr, transposed_input);
++    PimBo *pim_weight = PimCreateBo(pim_desc, MEM_TYPE_DEVICE, GEMM_WEIGHT, w_addr, transposed_weight);
++    PimBo *pim_output = PimCreateBo(pim_desc, MEM_TYPE_DEVICE, GEMM_OUTPUT, o_addr);
++
++    if (float_equal(gemm_desc.beta, 0))
++        PimExecuteGemm(pim_output, pim_input, pim_weight, nullptr, PimActFunc::NONE, gemm_order, (void*)(handle.GetStream()));
++    else
++        PimExecuteGemm(pim_output, pim_input, pim_weight, pim_output, PimActFunc::NONE, gemm_order, (void*)(handle.GetStream()));
++
++    PimDestroyBo(pim_input);
++    PimDestroyBo(pim_weight);
++    PimDestroyBo(pim_output);
++    PimDestroyGemmDesc(pim_desc);
++
++    return miopenStatusSuccess;
++}
++
+ } // namespace miopen
+diff --git a/src/include/miopen/gemm_v2.hpp b/src/include/miopen/gemm_v2.hpp
+index 8a7e3047..b94c99af 100644
+--- a/src/include/miopen/gemm_v2.hpp
++++ b/src/include/miopen/gemm_v2.hpp
+@@ -127,6 +127,15 @@ CallGemmStridedBatchedSequential(const Handle& handle,
+                                  bool enqueue_dummy_kernel,
+                                  GemmBackend_t gemm_backend = GemmBackend_t::rocblas);
+ 
++miopenStatus_t PimGemm(const Handle& handle,
++                       GemmDescriptor gemm_desc,
++                       ConstData_t A,
++                       int a_offset,
++                       ConstData_t B,
++                       int b_offset,
++                       Data_t C,
++                       int c_offset);
++
+ // GEMM parameters for Convolution (using Im2Col) Fwd
+ // y = w * Im2Col(x)
+ GemmDescriptor CreateGemmDescriptorConvFwd(const TensorDescriptor& wDesc,
+diff --git a/src/ocl/rnnocl.cpp b/src/ocl/rnnocl.cpp
+index 294a1dab..221fc14d 100644
+--- a/src/ocl/rnnocl.cpp
++++ b/src/ocl/rnnocl.cpp
+@@ -322,6 +322,7 @@ void RNNDescriptor::RNNForwardInference(Handle& handle,
+                                                               1, // alpha
+                                                               1, // beta
+                                                               xDesc[0].GetType()};
++
+             miopenStatus_t gemm_status = CallGemm(handle,
+                                                   gemm_desc,
+                                                   workSpace,
+@@ -636,6 +637,7 @@ void RNNDescriptor::RNNForwardInference(Handle& handle,
+                                                1, // alpha
+                                                1, // beta
+                                                xDesc[0].GetType()};
++
+                             miopenStatus_t gemm_status =
+                                 CallGemm(handle,
+                                          gemm_desc,
+@@ -684,18 +686,17 @@ void RNNDescriptor::RNNForwardInference(Handle& handle,
+                                                                               1, // beta
+                                                                               xDesc[0].GetType()};
+ 
+-                            miopenStatus_t gemm_status =
+-                                CallGemm(handle,
+-                                         gemm_desc,
+-                                         workSpace,
+-                                         pretime_shift + hid_off + ri * hy_h,
+-                                         w,
+-                                         wei_shift + ri * wei_len * uni_stride,
+-                                         workSpace,
+-                                         static_cast<int>(offset) + ri * wei_len,
+-                                         nullptr,
+-                                         false,
+-                                         GemmBackend_t::miopengemm);
++                            miopenStatus_t gemm_status = CallGemm(handle,
++                                                                  gemm_desc,
++                                                                  workSpace,
++                                                                  pretime_shift + hid_off + ri * hy_h,
++                                                                  w,
++                                                                  wei_shift + ri * wei_len * uni_stride,
++                                                                  workSpace,
++                                                                  static_cast<int>(offset) + ri * wei_len,
++                                                                  nullptr,
++                                                                  false,
++                                                                  GemmBackend_t::miopengemm);
+ 
+                             if(gemm_status != miopenStatusSuccess)
+                             {
+@@ -1308,6 +1309,16 @@ void RNNDescriptor::RNNForwardTraining(Handle& handle,
+         MIOPEN_THROW("Reservespace is required");
+     }
+ 
++    char env_p, *ptr;
++
++    if(std::getenv("ENABLE_PIM"))
++    {
++        ptr = std::getenv("ENABLE_PIM");
++        env_p = *ptr;
++    }
++    else
++        env_p = '0';
++
+     std::string network_config;
+     std::vector<int> in_n;
+     int in_h  = xDesc[0].GetLengths()[1]; // input vector size
+diff --git a/src/tensor_api.cpp b/src/tensor_api.cpp
+index 121ae30e..d3b25825 100644
+--- a/src/tensor_api.cpp
++++ b/src/tensor_api.cpp
+@@ -30,6 +30,7 @@
+ #include <miopen/logger.hpp>
+ #include <miopen/tensor.hpp>
+ #include <miopen/tensor_ops.hpp>
++#include <stdlib.h>
+ 
+ extern "C" miopenStatus_t miopenCreateTensorDescriptor(miopenTensorDescriptor_t* tensorDesc)
+ {
+@@ -269,6 +270,22 @@ extern "C" miopenStatus_t miopenOpTensor(miopenHandle_t handle,
+     });
+ }
+ 
++extern "C" miopenStatus_t PimOpTensor(miopenHandle_t handle,
++                                      miopenTensorOp_t tensorOp,
++                                      PimBo* input0,
++                                      PimBo* input1,
++                                      PimBo* output)
++{
++    return miopen::try_([&] {
++        if(tensorOp == miopenTensorOpAdd)
++            PimExecuteAdd(output, input0, input1, (void*)(miopen::deref(handle).GetStream()));
++        else if(tensorOp == miopenTensorOpMul)
++            PimExecuteMul(output, input0, input1, (void*)(miopen::deref(handle).GetStream()));
++        else
++            std::cout << "Not Implemented in PimOpTensor!!" << std::endl;
++    });
++}
++
+ extern "C" miopenStatus_t miopenSetTensor(miopenHandle_t handle,
+                                           const miopenTensorDescriptor_t yDesc,
+                                           void* y,
