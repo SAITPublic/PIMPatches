@@ -1,0 +1,1737 @@
+From 39d21b68d206c2e05b08ab8ae29489b7f323193f Mon Sep 17 00:00:00 2001
+From: Mike Kashkarov <m.kashkarov@samsung.com>
+Date: Sun, 9 Oct 2022 05:05:08 +0300
+Subject: [PATCH 2/2] Added missing changes for fir data descriptors to pim
+ conversion
+
+For add/mul ops
+---
+ .../include/flang/Optimizer/Dialect/FIROps.td |  12 +
+ flang/lib/Lower/Pim.cpp                       | 646 ++++++++++--------
+ flang/lib/Optimizer/CodeGen/CMakeLists.txt    |   1 +
+ flang/lib/Optimizer/CodeGen/CodeGen.cpp       |  17 +-
+ flang/lib/Optimizer/CodeGen/DescriptorModel.h |  22 +-
+ flang/lib/Optimizer/Dialect/FIROps.cpp        |   8 +
+ .../Transforms/PimDataOperandConversion.cpp   | 463 ++++++++++++-
+ flang/lib/Semantics/canonicalize-pim.cpp      |  48 +-
+ mlir/include/mlir/Dialect/Pim/PimOps.td       |  44 +-
+ mlir/lib/Dialect/Pim/IR/Pim.cpp               |  12 +
+ 10 files changed, 858 insertions(+), 415 deletions(-)
+
+diff --git a/flang/include/flang/Optimizer/Dialect/FIROps.td b/flang/include/flang/Optimizer/Dialect/FIROps.td
+index ff0642bf136a..38055f023c95 100644
+--- a/flang/include/flang/Optimizer/Dialect/FIROps.td
++++ b/flang/include/flang/Optimizer/Dialect/FIROps.td
+@@ -2851,4 +2851,16 @@ def fir_IsPresentOp : fir_SimpleOp<"is_present", [NoSideEffect]> {
+   let results = (outs BoolLike);
+ }
+ 
++def fir_CastOp : fir_SimpleOneResultOp<"cast", [NoSideEffect]> {
++  let summary = "Type cast between FIR dialect and LLVM";
++  let description = [{
++    cast op casts between FIR and LLVM dialects. It only chnages the dialect,
++    but doesn not change compile-time or runtime semantics.
++  }];
++  let arguments = (ins fir_Type:$in);
++  let results = (outs AnyType:$res);
++  let assemblyFormat = "$in attr-dict `:` type($in) `to` type($res)";
++  let hasVerifier = 1;
++}
++
+ #endif
+diff --git a/flang/lib/Lower/Pim.cpp b/flang/lib/Lower/Pim.cpp
+index 4e138d9bccba..bd80958c69b6 100644
+--- a/flang/lib/Lower/Pim.cpp
++++ b/flang/lib/Lower/Pim.cpp
+@@ -27,11 +27,8 @@
+ 
+ #include "flang/Lower/ConvertExpr.h"
+ 
+-
+-
+ #define DEBUG_TYPE "pim-lower"
+ 
+-
+ static const Fortran::parser::Name *
+ getDesignatorNameIfDataRef(const Fortran::parser::Designator &designator) {
+   const auto *dataRef = std::get_if<Fortran::parser::DataRef>(&designator.u);
+@@ -68,11 +65,10 @@ static void createEmptyRegionBlocks(
+       } else {
+         [[maybe_unused]] auto &terminatorOp = eval.block->back();
+         assert(
+-               // (mlir::isa<mlir::pim::TerminatorOp>(terminatorOp) ||
+-                mlir::isa<mlir::pim::YieldOp>(terminatorOp)
+-                // )
+-               &&
+-               "expected terminator op");
++            // (mlir::isa<mlir::pim::TerminatorOp>(terminatorOp) ||
++            mlir::isa<mlir::pim::YieldOp>(terminatorOp)
++            // )
++            && "expected terminator op");
+       }
+     }
+     if (!eval.isDirective() && eval.hasNestedEvaluations())
+@@ -81,7 +77,8 @@ static void createEmptyRegionBlocks(
+ }
+ 
+ static void resetBeforeTerminator(fir::FirOpBuilder &firOpBuilder,
+-                           mlir::Operation *storeOp, mlir::Block &block) {
++                                  mlir::Operation *storeOp,
++                                  mlir::Block &block) {
+   if (storeOp)
+     firOpBuilder.setInsertionPointAfter(storeOp);
+   else
+@@ -127,7 +124,7 @@ static bool privatizeVars(Op &op, Fortran::lower::AbstractConverter &converter,
+   mlir::arith::CmpIOp cmpOp;
+ 
+   for (const Fortran::parser::PimClause &clause : opClauseList.v) {
+-      // collectPimObjectListSymbol(clause->v, privatizedSymbols);
++    // collectPimObjectListSymbol(clause->v, privatizedSymbols);
+     if (const auto &privateClause =
+             std::get_if<Fortran::parser::PimClause::Copyin>(&clause.u)) {
+       collectPimObjectListSymbol(privateClause->v, privatizedSymbols);
+@@ -137,13 +134,13 @@ static bool privatizeVars(Op &op, Fortran::lower::AbstractConverter &converter,
+       collectPimObjectListSymbol(firstPrivateClause->v, privatizedSymbols);
+       hasFirstPrivateOp = true;
+     } else if (const auto &lastPrivateClause =
+-                   std::get_if<Fortran::parser::PimClause::Copy>(
+-                       &clause.u)) {
++                   std::get_if<Fortran::parser::PimClause::Copy>(&clause.u)) {
+       // TODO: Add lastprivate support for sections construct, simd construct
+       // if (std::is_same_v<Op, mlir::pim::ParallelOp>) {
+-      //   mlir::pim::ParallelOp *wsLoopOp = llvm::dyn_cast<mlir::pim::ParallelOp>(&op);
+-      //   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+-      //   auto insPt = firOpBuilder.saveInsertionPoint();
++      //   mlir::pim::ParallelOp *wsLoopOp =
++      //   llvm::dyn_cast<mlir::pim::ParallelOp>(&op); fir::FirOpBuilder
++      //   &firOpBuilder = converter.getFirOpBuilder(); auto insPt =
++      //   firOpBuilder.saveInsertionPoint();
+ 
+       //   // Our goal here is to introduce the following control flow
+       //   // just before exiting the worksharing loop.
+@@ -167,15 +164,17 @@ static bool privatizeVars(Op &op, Fortran::lower::AbstractConverter &converter,
+       //   //    omp.yield
+       //   // }
+ 
+-      //   mlir::Operation *lastOper = wsLoopOp->region().back().getTerminator();
++      //   mlir::Operation *lastOper =
++      //   wsLoopOp->region().back().getTerminator();
+ 
+       //   firOpBuilder.setInsertionPoint(lastOper);
+ 
+-      //   // // TODO: The following will not work when there is collapse present.
++      //   // // TODO: The following will not work when there is collapse
++      //   present.
+       //   // // Have to modify this in future.
+       //   // for (const Fortran::parser::PimClause &clause : opClauseList.v)
+       //   //   if (const auto &collapseClause =
+-      //   //           std::get_if<Fortran::parser::OmpClause::Collapse>(&clause.u))
++      //   // std::get_if<Fortran::parser::OmpClause::Collapse>(&clause.u))
+       //   //     TODO(converter.getCurrentLocation(),
+       //   //          "Collapse clause with lastprivate");
+       //   // Only generate the compare once in presence of multiple LastPrivate
+@@ -265,7 +264,6 @@ static bool privatizeVars(Op &op, Fortran::lower::AbstractConverter &converter,
+   return hasLastPrivateOp;
+ }
+ 
+-
+ static void
+ genCopyinClause(Fortran::lower::AbstractConverter &converter,
+                 const Fortran::parser::PimClauseList &opClauseList) {
+@@ -301,15 +299,14 @@ genCopyinClause(Fortran::lower::AbstractConverter &converter,
+   firOpBuilder.restoreInsertionPoint(insPt);
+ }
+ 
+-
+ template <typename Op>
+-static void
+-createBodyOfOp(Op &op, Fortran::lower::AbstractConverter &converter,
+-               mlir::Location &loc, Fortran::lower::pft::Evaluation &eval,
+-               llvm::SmallVectorImpl<int32_t> &operandSegments,
+-               const Fortran::parser::PimClauseList *clauses = nullptr,
+-               const llvm::SmallVector<const Fortran::semantics::Symbol *> &args = {},
+-               bool outerCombined = false) {
++static void createBodyOfOp(
++    Op &op, Fortran::lower::AbstractConverter &converter, mlir::Location &loc,
++    Fortran::lower::pft::Evaluation &eval,
++    llvm::SmallVectorImpl<int32_t> &operandSegments,
++    const Fortran::parser::PimClauseList *clauses = nullptr,
++    const llvm::SmallVector<const Fortran::semantics::Symbol *> &args = {},
++    bool outerCombined = false) {
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+   // If an argument for the region is provided then create the block with that
+   // argument. Also update the symbol's address with the mlir argument value.
+@@ -394,7 +391,6 @@ createBodyOfOp(Op &op, Fortran::lower::AbstractConverter &converter,
+   firOpBuilder.setInsertionPointToStart(&block);
+ }
+ 
+-
+ template <typename Op, typename Terminator>
+ static Op
+ createRegionOp(fir::FirOpBuilder &builder, mlir::Location loc,
+@@ -461,7 +457,7 @@ static void genObjectListWithModifier(
+   // if (modifier && (*modifier).v == mod) {
+   //   genObjectList(pimObjectList, converter, operandsWithModifier);
+   // } else {
+-    genObjectList(listWithModifier, converter, operands);
++  genObjectList(listWithModifier, converter, operands);
+   // }
+ }
+ 
+@@ -478,7 +474,7 @@ createParallelOp(Fortran::lower::AbstractConverter &converter,
+                  Fortran::lower::pft::Evaluation &eval,
+                  Fortran::semantics::SemanticsContext &semanticsContext,
+                  Fortran::lower::StatementContext &stmtCtx,
+-                 const Fortran::parser::PimClauseList& pimClauseList) {
++                 const Fortran::parser::PimClauseList &pimClauseList) {
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+   mlir::Location currentLocation = converter.getCurrentLocation();
+ 
+@@ -487,19 +483,20 @@ createParallelOp(Fortran::lower::AbstractConverter &converter,
+   llvm::SmallVector<mlir::Value, 2> copyinOperands, copyinReadonlyOperands;
+   llvm::SmallVector<mlir::Value, 2> copyoutOperands, copyoutZeroOperands;
+   for (const Fortran::parser::PimClause &clause : pimClauseList.v) {
+-    if (const auto& copyinClause{std::get_if<Fortran::parser::PimClause::Copyin>(&clause.u)}) {
++    if (const auto &copyinClause{
++            std::get_if<Fortran::parser::PimClause::Copyin>(&clause.u)}) {
+       genObjectListWithModifier<Fortran::parser::PimClause::Copyin>(
+           copyinClause, converter,
+           Fortran::parser::PimDataModifier::Modifier::ReadOnly,
+           copyinReadonlyOperands, copyinOperands);
+     }
+-    if (const auto& copyoutClause{std::get_if<Fortran::parser::PimClause::Copyout>(&clause.u)}) {
++    if (const auto &copyoutClause{
++            std::get_if<Fortran::parser::PimClause::Copyout>(&clause.u)}) {
+       genObjectListWithModifier<Fortran::parser::PimClause::Copyout>(
+           copyoutClause, converter,
+           Fortran::parser::PimDataModifier::Modifier::Zero, copyoutZeroOperands,
+           copyoutOperands);
+     }
+-
+   }
+ 
+   // llvm::SmallVector<mlir::Value, 2> libcallsOperands;
+@@ -511,10 +508,9 @@ createParallelOp(Fortran::lower::AbstractConverter &converter,
+   // addOperands(operands, operandSegments, copyoutZeroOperands);
+   // addOperands(operands, operandSegments, libcallsOperands);
+ 
+-
+   llvm::ArrayRef<mlir::Type> argTy;
+-  auto parallelOp = firOpBuilder.create<mlir::pim::ParallelOp>(
+-      currentLocation, argTy, operands);
++  auto parallelOp = firOpBuilder.create<mlir::pim::ParallelOp>(currentLocation,
++                                                               argTy, operands);
+ 
+   createBodyOfOp<mlir::pim::ParallelOp>(parallelOp, converter, currentLocation,
+                                         eval, operandSegments, &pimClauseList,
+@@ -522,7 +518,8 @@ createParallelOp(Fortran::lower::AbstractConverter &converter,
+ 
+   return parallelOp;
+ 
+-  // auto parallelOp = createRegionOp<mlir::pim::ParallelOp, mlir::pim::YieldOp>(
++  // auto parallelOp = createRegionOp<mlir::pim::ParallelOp,
++  // mlir::pim::YieldOp>(
+   //     firOpBuilder, currentLocation, operands, operandSegments);
+   // return parallelOp;
+ }
+@@ -533,11 +530,11 @@ createParallelOp(Fortran::lower::AbstractConverter &converter,
+ //   fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+ //   mlir::Location loc = converter.getCurrentLocation();
+ 
+-  // mlir::Value shape = builder.createShape(loc, exv);
++// mlir::Value shape = builder.createShape(loc, exv);
+ 
+-  // mlir::pim::PimDesc pimDesc =
+-  //     builder.create<mlir::pim::PimDesc>(loc, shape, mlir::pim::FP16_FLAG);
+-  // return pimDesc;
++// mlir::pim::PimDesc pimDesc =
++//     builder.create<mlir::pim::PimDesc>(loc, shape, mlir::pim::FP16_FLAG);
++// return pimDesc;
+ // }
+ 
+ void Fortran::lower::genPimConstruct(
+@@ -559,7 +556,8 @@ void Fortran::lower::genPimConstruct(
+             const auto &pimClauseList =
+                 std::get<Fortran::parser::PimClauseList>(beginBlockDirective.t);
+             Fortran::lower::StatementContext stmtCtx;
+-            createParallelOp(converter, eval, semanticsContext, stmtCtx, pimClauseList);
++            createParallelOp(converter, eval, semanticsContext, stmtCtx,
++                             pimClauseList);
+           },
+           [&](const Fortran::parser::PimLoopConstruct &loopConstruct) {
+             TODO(converter.getCurrentLocation(),
+@@ -570,10 +568,8 @@ void Fortran::lower::genPimConstruct(
+       pimConstruct.u);
+ }
+ 
+-
+ #include "flang/Lower/DumpEvaluateExpr.h"
+ 
+-
+ void Fortran::lower::genPimOperations(
+     Fortran::lower::AbstractConverter &converter,
+     Fortran::lower::pft::Evaluation &eval,
+@@ -583,157 +579,298 @@ void Fortran::lower::genPimOperations(
+   std::visit(
+       Fortran::common::visitors{
+           [&](const Fortran::parser::PimAdd &pimAdd) {
+-              const Fortran::parser::Expr &expr{std::get<Fortran::parser::Expr>(pimAdd.t)};
+-              const Fortran::parser::Variable &var{std::get<Fortran::parser::Variable>(pimAdd.t)};
+-
+-
+-              auto *addExpr{Fortran::parser::Unwrap<Fortran::parser::Expr::Add>(expr.u)};
+-
+-              const Fortran::common::Indirection<Fortran::parser::Expr>& lhs = std::get<0>(addExpr->t);
+-              const Fortran::common::Indirection<Fortran::parser::Expr>& rhs = std::get<1>(addExpr->t);
+-              // const auto& hhs = std::get<0>(addExpr->t);
+-              // const auto& rhs = std::get<0>(addExpr->t);
+-
+-              mlir::Value lhs_val, rhs_val, var_val;
+-
+-              std::visit(
+-                  Fortran::common::visitors{
+-                      [&](const Fortran::common::Indirection<
+-                          Fortran::parser::Designator> &designator) {
+-                        // assert(*designator &&
+-                        //        "Variable designator PIM assert");
+-                          const auto *dataRef = std::get_if<Fortran::parser::DataRef>(&designator.value().u);
+-                          const Fortran::common::Indirection<
+-                                  Fortran::parser::ArrayElement> *arrayElem =
+-                              std::get_if<Fortran::common::Indirection<
+-                                  Fortran::parser::ArrayElement>>(&dataRef->u);
+-                          if (!arrayElem) {
+-                            fir::emitFatalError(
+-                                loc, "Unexpected non-array element in pim loop");
+-                          }
+-                          const Fortran::parser::DataRef &baseRef = arrayElem->value().base;
+-//   return dataRef ? std::get_if<Fortran::parser::Name>(&dataRef->u) : nullptr;
+-                        // const auto *name =
+-                        //     getDesignatorNameIfDataRef(designator.value());
+-                        const auto *name = std::get_if<Fortran::parser::Name>(&baseRef.u);
+-                          const auto variable =
+-                              converter.getSymbolAddress(*name->symbol);
+-                          lhs_val = variable;
+-                      },
+-                      [&](auto &&) { assert(false); }},
+-                  lhs.value().u);
+-
+-              std::visit(
+-                  Fortran::common::visitors{
+-                      [&](const Fortran::common::Indirection<
+-                          Fortran::parser::Designator> &designator) {
+-                        // assert(*designator &&
+-                        //        "Variable designator PIM assert");
+-                          const auto *dataRef = std::get_if<Fortran::parser::DataRef>(&designator.value().u);
+-                          const Fortran::common::Indirection<
+-                                  Fortran::parser::ArrayElement> *arrayElem =
+-                              std::get_if<Fortran::common::Indirection<
+-                                  Fortran::parser::ArrayElement>>(&dataRef->u);
+-                          if (!arrayElem) {
+-                            fir::emitFatalError(
+-                                loc, "Unexpected non-array element in pim loop");
+-                          }
+-                          const Fortran::parser::DataRef &baseRef = arrayElem->value().base;
+-//   return dataRef ? std::get_if<Fortran::parser::Name>(&dataRef->u) : nullptr;
+-                        // const auto *name =
+-                        //     getDesignatorNameIfDataRef(designator.value());
+-                        const auto *name = std::get_if<Fortran::parser::Name>(&baseRef.u);
+-                          const auto variable =
+-                              converter.getSymbolAddress(*name->symbol);
+-                          rhs_val = variable;
+-                      },
+-                      [&](auto &&) { assert(false); }},
+-                  rhs.value().u);
+-
+-
+-              // Resutl
+-              std::visit(
+-                  Fortran::common::visitors{
+-                      [&](const Fortran::common::Indirection<
+-                          Fortran::parser::Designator> &designator) {
+-                        // assert(*designator &&
+-                        //        "Variable designator PIM assert");
+-                          const auto *dataRef = std::get_if<Fortran::parser::DataRef>(&designator.value().u);
+-                          const Fortran::common::Indirection<
+-                                  Fortran::parser::ArrayElement> *arrayElem =
+-                              std::get_if<Fortran::common::Indirection<
+-                                  Fortran::parser::ArrayElement>>(&dataRef->u);
+-                          if (!arrayElem) {
+-                            fir::emitFatalError(
+-                                loc, "Unexpected non-array element in pim loop");
+-                          }
+-                          const Fortran::parser::DataRef &baseRef = arrayElem->value().base;
+-//   return dataRef ? std::get_if<Fortran::parser::Name>(&dataRef->u) : nullptr;
+-                        // const auto *name =
+-                        //     getDesignatorNameIfDataRef(designator.value());
+-                        const auto *name = std::get_if<Fortran::parser::Name>(&baseRef.u);
+-                          const auto variable =
+-                              converter.getSymbolAddress(*name->symbol);
+-                          var_val = variable;
+-                      },
+-                      [&](auto &&) { assert(false); }},
+-                  var.u);
+-
+-              fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+-
+-
+-              Fortran::lower::StatementContext stmtCtx;
+-              mlir::Value retAddress = fir::getBase(converter.genExprAddr(
+-                                                     *Fortran::semantics::GetExpr(var), stmtCtx));
+-
+-              assert(rhs_val.getType() == lhs_val.getType());
+-              mlir::Type operandTy = rhs_val.getType();
+-
+-              // fir.ref<fir.ref> and fir.ptr<fir.ref> are forbidden. Use
+-              // fir.llvm_ptr if needed.
+-              auto ty = operandTy.isa<fir::ReferenceType>()
+-                            ? mlir::Type(fir::LLVMPointerType::get(operandTy))
+-                            : mlir::Type(firOpBuilder.getRefType(operandTy));
+-              // return builder.create<fir::CoordinateOp>(loc, ty, tupleArg,
+-              //                                          offset);
+-
+-
+-              // mlir::Value temp = firOpBuilder.createTemporary(loc, operandTy,
+-              //                                                 llvm::ArrayRef<mlir::NamedAttribute>{
+-              //                                                   Fortran::lower::getAdaptToByRefAttr(firOpBuilder)});
+-              // mlir::Value temp =
+-              //     firOpBuilder.create<mlir::pim::CreateBufferObject>(
+-              //         loc, operandTy, var_val);
+-
+-              auto *context = &converter.getMLIRContext();
+-              mlir::Type pimBufferTy = mlir::pim::BufferType::get(context, mlir::FloatType::getF16(context));
+-              mlir::Value lhs_buf =
+-                  firOpBuilder.create<mlir::pim::CreateBufferObject>(
+-                      loc, pimBufferTy, lhs_val, mlir::pim::MemType::HOST);
+-              mlir::Value rhs_buf =
+-                  firOpBuilder.create<mlir::pim::CreateBufferObject>(
+-                      loc, pimBufferTy, rhs_val, mlir::pim::MemType::HOST);
+-              mlir::Value ret_buf =
+-                  firOpBuilder.create<mlir::pim::CreateBufferObject>(
+-                      loc, pimBufferTy, var_val, mlir::pim::MemType::PIM);
+-
+-
+-
+-              // ret_buf = firOpBuilder.create<mlir::pim::AddOpNew>(loc, pimBufferTy, lhs_buf, rhs_buf);
+-              firOpBuilder.create<mlir::pim::AddOpNew>(loc, lhs_buf, rhs_buf, ret_buf);
+-
+-              // mlir::Value unwrappedBuf =
+-                  firOpBuilder.create<mlir::pim::UnwrapBufferObject>(
+-                      loc, ret_buf, var_val);
+-
+-              // auto resultRef = firOpBuilder.createConvert(loc, var_val.getType(), unwrappedBuf);
+-              // firOpBuilder.create<fir::LoadOp>(loc, resultRef);
+-              // firOpBuilder.create<fir::StoreOp>(loc, unwrappedBuf, var_val);
++            const Fortran::parser::Expr &expr{
++                std::get<Fortran::parser::Expr>(pimAdd.t)};
++            const Fortran::parser::Variable &var{
++                std::get<Fortran::parser::Variable>(pimAdd.t)};
++            auto *addExpr{
++                Fortran::parser::Unwrap<Fortran::parser::Expr::Add>(expr.u)};
++            const Fortran::common::Indirection<Fortran::parser::Expr> &lhs =
++                std::get<0>(addExpr->t);
++            const Fortran::common::Indirection<Fortran::parser::Expr> &rhs =
++                std::get<1>(addExpr->t);
++            mlir::Value lhs_val, rhs_val, var_val;
++
++            std::visit(
++                Fortran::common::visitors{
++                    [&](const Fortran::common::Indirection<
++                        Fortran::parser::Designator> &designator) {
++                      // assert(*designator &&
++                      //        "Variable designator PIM assert");
++                      const auto *dataRef =
++                          std::get_if<Fortran::parser::DataRef>(
++                              &designator.value().u);
++                      const Fortran::common::Indirection<
++                          Fortran::parser::ArrayElement> *arrayElem =
++                          std::get_if<Fortran::common::Indirection<
++                              Fortran::parser::ArrayElement>>(&dataRef->u);
++                      if (!arrayElem) {
++                        fir::emitFatalError(
++                            loc, "Unexpected non-array element in pim loop");
++                      }
++                      const Fortran::parser::DataRef &baseRef =
++                          arrayElem->value().base;
++                      //   return dataRef ?
++                      //   std::get_if<Fortran::parser::Name>(&dataRef->u) :
++                      //   nullptr;
++                      // const auto *name =
++                      //     getDesignatorNameIfDataRef(designator.value());
++                      const auto *name =
++                          std::get_if<Fortran::parser::Name>(&baseRef.u);
++                      const auto variable =
++                          converter.getSymbolAddress(*name->symbol);
++                      lhs_val = variable;
++                    },
++                    [&](auto &&) { assert(false); }},
++                lhs.value().u);
++
++            std::visit(
++                Fortran::common::visitors{
++                    [&](const Fortran::common::Indirection<
++                        Fortran::parser::Designator> &designator) {
++                      // assert(*designator &&
++                      //        "Variable designator PIM assert");
++                      const auto *dataRef =
++                          std::get_if<Fortran::parser::DataRef>(
++                              &designator.value().u);
++                      const Fortran::common::Indirection<
++                          Fortran::parser::ArrayElement> *arrayElem =
++                          std::get_if<Fortran::common::Indirection<
++                              Fortran::parser::ArrayElement>>(&dataRef->u);
++                      if (!arrayElem) {
++                        fir::emitFatalError(
++                            loc, "Unexpected non-array element in pim loop");
++                      }
++                      const Fortran::parser::DataRef &baseRef =
++                          arrayElem->value().base;
++                      //   return dataRef ?
++                      //   std::get_if<Fortran::parser::Name>(&dataRef->u) :
++                      //   nullptr;
++                      // const auto *name =
++                      //     getDesignatorNameIfDataRef(designator.value());
++                      const auto *name =
++                          std::get_if<Fortran::parser::Name>(&baseRef.u);
++                      const auto variable =
++                          converter.getSymbolAddress(*name->symbol);
++                      rhs_val = variable;
++                    },
++                    [&](auto &&) { assert(false); }},
++                rhs.value().u);
++
++            // Resutl
++            std::visit(
++                Fortran::common::visitors{
++                    [&](const Fortran::common::Indirection<
++                        Fortran::parser::Designator> &designator) {
++                      // assert(*designator &&
++                      //        "Variable designator PIM assert");
++                      const auto *dataRef =
++                          std::get_if<Fortran::parser::DataRef>(
++                              &designator.value().u);
++                      const Fortran::common::Indirection<
++                          Fortran::parser::ArrayElement> *arrayElem =
++                          std::get_if<Fortran::common::Indirection<
++                              Fortran::parser::ArrayElement>>(&dataRef->u);
++                      if (!arrayElem) {
++                        fir::emitFatalError(
++                            loc, "Unexpected non-array element in pim loop");
++                      }
++                      const Fortran::parser::DataRef &baseRef =
++                          arrayElem->value().base;
++                      const auto *name =
++                          std::get_if<Fortran::parser::Name>(&baseRef.u);
++                      const auto variable =
++                          converter.getSymbolAddress(*name->symbol);
++                      var_val = variable;
++                    },
++                    [&](auto &&) { assert(false); }},
++                var.u);
++
++            fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
++
++            Fortran::lower::StatementContext stmtCtx;
++            mlir::Value retAddress = fir::getBase(converter.genExprAddr(
++                *Fortran::semantics::GetExpr(var), stmtCtx));
++
++            assert(rhs_val.getType() == lhs_val.getType());
++            mlir::Type operandTy = rhs_val.getType();
++
++            // fir.ref<fir.ref> and fir.ptr<fir.ref> are forbidden. Use
++            // fir.llvm_ptr if needed.
++            auto ty = operandTy.isa<fir::ReferenceType>()
++                          ? mlir::Type(fir::LLVMPointerType::get(operandTy))
++                          : mlir::Type(firOpBuilder.getRefType(operandTy));
++            // return builder.create<fir::CoordinateOp>(loc, ty, tupleArg,
++            //                                          offset);
++
++            // mlir::Value temp = firOpBuilder.createTemporary(loc, operandTy,
++            //                                                 llvm::ArrayRef<mlir::NamedAttribute>{
++            //                                                   Fortran::lower::getAdaptToByRefAttr(firOpBuilder)});
++            // mlir::Value temp =
++            //     firOpBuilder.create<mlir::pim::CreateBufferObject>(
++            //         loc, operandTy, var_val);
++
++            auto *context = &converter.getMLIRContext();
++            mlir::Type pimBufferTy = mlir::pim::BufferType::get(
++                context, mlir::FloatType::getF16(context));
++            mlir::Value lhs_buf =
++                firOpBuilder.create<mlir::pim::CreateBufferObject>(
++                    loc, pimBufferTy, lhs_val, mlir::pim::MemType::HOST);
++            mlir::Value rhs_buf =
++                firOpBuilder.create<mlir::pim::CreateBufferObject>(
++                    loc, pimBufferTy, rhs_val, mlir::pim::MemType::HOST);
++            mlir::Value ret_buf =
++                firOpBuilder.create<mlir::pim::CreateBufferObject>(
++                    loc, pimBufferTy, var_val, mlir::pim::MemType::PIM);
++
++            // ret_buf = firOpBuilder.create<mlir::pim::AddOpNew>(loc,
++            // pimBufferTy, lhs_buf, rhs_buf);
++            firOpBuilder.create<mlir::pim::AddOp>(loc, lhs_buf, rhs_buf,
++                                                  ret_buf);
++
++            // mlir::Value unwrappedBuf =
++            firOpBuilder.create<mlir::pim::UnwrapBufferObject>(loc, ret_buf,
++                                                               var_val);
++          },
++          [&](const Fortran::parser::PimMul &pimMul) {
++            const Fortran::parser::Expr &expr{
++                std::get<Fortran::parser::Expr>(pimMul.t)};
++            const Fortran::parser::Variable &var{
++                std::get<Fortran::parser::Variable>(pimMul.t)};
++            auto *addExpr{
++                Fortran::parser::Unwrap<Fortran::parser::Expr::Multiply>(
++                    expr.u)};
++            const Fortran::common::Indirection<Fortran::parser::Expr> &lhs =
++                std::get<0>(addExpr->t);
++            const Fortran::common::Indirection<Fortran::parser::Expr> &rhs =
++                std::get<1>(addExpr->t);
++            mlir::Value lhs_val, rhs_val, var_val;
++
++            std::visit(
++                Fortran::common::visitors{
++                    [&](const Fortran::common::Indirection<
++                        Fortran::parser::Designator> &designator) {
++                      // assert(*designator &&
++                      //        "Variable designator PIM assert");
++                      const auto *dataRef =
++                          std::get_if<Fortran::parser::DataRef>(
++                              &designator.value().u);
++                      const Fortran::common::Indirection<
++                          Fortran::parser::ArrayElement> *arrayElem =
++                          std::get_if<Fortran::common::Indirection<
++                              Fortran::parser::ArrayElement>>(&dataRef->u);
++                      if (!arrayElem) {
++                        fir::emitFatalError(
++                            loc, "Unexpected non-array element in pim loop");
++                      }
++                      const Fortran::parser::DataRef &baseRef =
++                          arrayElem->value().base;
++                      const auto *name =
++                          std::get_if<Fortran::parser::Name>(&baseRef.u);
++                      const auto variable =
++                          converter.getSymbolAddress(*name->symbol);
++                      lhs_val = variable;
++                    },
++                    [&](auto &&) { assert(false); }},
++                lhs.value().u);
++
++            std::visit(
++                Fortran::common::visitors{
++                    [&](const Fortran::common::Indirection<
++                        Fortran::parser::Designator> &designator) {
++                      // assert(*designator &&
++                      //        "Variable designator PIM assert");
++                      const auto *dataRef =
++                          std::get_if<Fortran::parser::DataRef>(
++                              &designator.value().u);
++                      const Fortran::common::Indirection<
++                          Fortran::parser::ArrayElement> *arrayElem =
++                          std::get_if<Fortran::common::Indirection<
++                              Fortran::parser::ArrayElement>>(&dataRef->u);
++                      if (!arrayElem) {
++                        fir::emitFatalError(
++                            loc, "Unexpected non-array element in pim loop");
++                      }
++                      const Fortran::parser::DataRef &baseRef =
++                          arrayElem->value().base;
++                      //   return dataRef ?
++                      //   std::get_if<Fortran::parser::Name>(&dataRef->u) :
++                      //   nullptr;
++                      // const auto *name =
++                      //     getDesignatorNameIfDataRef(designator.value());
++                      const auto *name =
++                          std::get_if<Fortran::parser::Name>(&baseRef.u);
++                      const auto variable =
++                          converter.getSymbolAddress(*name->symbol);
++                      rhs_val = variable;
++                    },
++                    [&](auto &&) { assert(false); }},
++                rhs.value().u);
++
++            // Resutl
++            std::visit(
++                Fortran::common::visitors{
++                    [&](const Fortran::common::Indirection<
++                        Fortran::parser::Designator> &designator) {
++                      // assert(*designator &&
++                      //        "Variable designator PIM assert");
++                      const auto *dataRef =
++                          std::get_if<Fortran::parser::DataRef>(
++                              &designator.value().u);
++                      const Fortran::common::Indirection<
++                          Fortran::parser::ArrayElement> *arrayElem =
++                          std::get_if<Fortran::common::Indirection<
++                              Fortran::parser::ArrayElement>>(&dataRef->u);
++                      if (!arrayElem) {
++                        fir::emitFatalError(
++                            loc, "Unexpected non-array element in pim loop");
++                      }
++                      const Fortran::parser::DataRef &baseRef =
++                          arrayElem->value().base;
++                      const auto *name =
++                          std::get_if<Fortran::parser::Name>(&baseRef.u);
++                      const auto variable =
++                          converter.getSymbolAddress(*name->symbol);
++                      var_val = variable;
++                    },
++                    [&](auto &&) { assert(false); }},
++                var.u);
++
++            fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+ 
++            Fortran::lower::StatementContext stmtCtx;
++            mlir::Value retAddress = fir::getBase(converter.genExprAddr(
++                *Fortran::semantics::GetExpr(var), stmtCtx));
++
++            assert(rhs_val.getType() == lhs_val.getType());
++            mlir::Type operandTy = rhs_val.getType();
++
++            // fir.ref<fir.ref> and fir.ptr<fir.ref> are forbidden. Use
++            // fir.llvm_ptr if needed.
++            auto ty = operandTy.isa<fir::ReferenceType>()
++                          ? mlir::Type(fir::LLVMPointerType::get(operandTy))
++                          : mlir::Type(firOpBuilder.getRefType(operandTy));
++            auto *context = &converter.getMLIRContext();
++            mlir::Type pimBufferTy = mlir::pim::BufferType::get(
++                context, mlir::FloatType::getF16(context));
++            mlir::Value lhs_buf =
++                firOpBuilder.create<mlir::pim::CreateBufferObject>(
++                    loc, pimBufferTy, lhs_val, mlir::pim::MemType::HOST);
++            mlir::Value rhs_buf =
++                firOpBuilder.create<mlir::pim::CreateBufferObject>(
++                    loc, pimBufferTy, rhs_val, mlir::pim::MemType::HOST);
++            mlir::Value ret_buf =
++                firOpBuilder.create<mlir::pim::CreateBufferObject>(
++                    loc, pimBufferTy, var_val, mlir::pim::MemType::PIM);
++            firOpBuilder.create<mlir::pim::MulOp>(loc, lhs_buf, rhs_buf,
++                                                  ret_buf);
++
++            // mlir::Value unwrappedBuf =
++            firOpBuilder.create<mlir::pim::UnwrapBufferObject>(loc, ret_buf,
++                                                               var_val);
+           },
+           [&](auto &&) {
+-            TODO(converter.getCurrentLocation(),
+-                 "PIM op not lowered yet!");
++            TODO(converter.getCurrentLocation(), "PIM op not lowered yet!");
+           },
+       },
+       pimOp.u);
+@@ -743,125 +880,27 @@ void Fortran::lower::genPimOperations(
+     Fortran::lower::AbstractConverter &converter,
+     Fortran::lower::pft::Evaluation &eval,
+     const Fortran::parser::PimConstruct &pimConstruct) {
+-
+-    // const auto &doLoop = std::get<Fortran::parser::PimLoopConstruct>(pimConstruct.u);
+-    // const auto &doConstruct = std::get<std::optional<Fortran::parser::DoConstruct>>(doLoop.t);
+-    // const auto &block = std::get<Fortran::parser::Block>(doConstruct->t);
+-
+-    // for (const auto & x : block) {
+-    // std::visit(Fortran::common::visitors{
+-    //                [&](const Fortran::parser::Designator &designator) {
+-    //   const auto &smth = std::get<Fortran::parser::
+-    //   LLVM_DEBUG(Fortran::lower::DumpEvaluateExpr::dump(
+-    //       llvm::dbgs() << "determine shape of:\n", x.));
+-    // }
+-
+-    // const auto &doConstruct = std::get<Fortran::parser::DoConstruct>(doLoop.t);
+-    // doCon
+-
+-  // llvm::SmallVector<mlir::Value> lowerBound, upperBound, step, linearVars,
+-  //     linearStepVars, reductionVars;
+-  // // Collect the loops to collapse.
+-  // auto *doConstructEval = &eval.getFirstNestedEvaluation();
+-
+-  // const auto &loopOpClauseList = std::get<Fortran::parser::OmpClauseList>(
+-  //     std::get<Fortran::parser::OmpBeginLoopDirective>(loopConstruct.t).t);
+-
+-  // std::int64_t collapseValue =
+-  //     Fortran::lower::getCollapseValue(loopOpClauseList);
+-  // std::size_t loopVarTypeSize = 0;
+-  // SmallVector<const Fortran::semantics::Symbol *> iv;
+-  // do {
+-  //   auto *doLoop = &doConstructEval->getFirstNestedEvaluation();
+-  //   auto *doStmt = doLoop->getIf<Fortran::parser::NonLabelDoStmt>();
+-  //   assert(doStmt && "Expected do loop to be in the nested evaluation");
+-  //   const auto &loopControl =
+-  //       std::get<std::optional<Fortran::parser::LoopControl>>(doStmt->t);
+-  //   const Fortran::parser::LoopControl::Bounds *bounds =
+-  //       std::get_if<Fortran::parser::LoopControl::Bounds>(&loopControl->u);
+-  //   assert(bounds && "Expected bounds for worksharing do loop");
+-  //   Fortran::lower::StatementContext stmtCtx;
+-  //   lowerBound.push_back(fir::getBase(converter.genExprValue(
+-  //       *Fortran::semantics::GetExpr(bounds->lower), stmtCtx)));
+-  //   upperBound.push_back(fir::getBase(converter.genExprValue(
+-  //       *Fortran::semantics::GetExpr(bounds->upper), stmtCtx)));
+-  //   if (bounds->step) {
+-  //     step.push_back(fir::getBase(converter.genExprValue(
+-  //         *Fortran::semantics::GetExpr(bounds->step), stmtCtx)));
+-  //   } else { // If `step` is not present, assume it as `1`.
+-  //     step.push_back(firOpBuilder.createIntegerConstant(
+-  //         currentLocation, firOpBuilder.getIntegerType(32), 1));
+-  //   }
+-  //   iv.push_back(bounds->name.thing.symbol);
+-  //   loopVarTypeSize = std::max(loopVarTypeSize,
+-  //                              bounds->name.thing.symbol->GetUltimate().size());
+-
+-  //   collapseValue--;
+-  //   doConstructEval =
+-  //       &*std::next(doConstructEval->getNestedEvaluations().begin());
+-  // } while (collapseValue > 0);
+-  
+-
+   fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+ 
+-
+-  // ---------------------------------------------------------------------------
+-
+-  // // Collect the loops to collapse.
+-  // auto *doConstructEval = &eval.getFirstNestedEvaluation();
+-
+-  // // std::int64_t collapseValue =
+-  // //     Fortran::lower::getCollapseValue(loopOpClauseList);
+-  // std::size_t loopVarTypeSize = 0;
+-  // SmallVector<const Fortran::semantics::Symbol *> iv;
+-  // do {
+-  //   auto *doLoop = &doConstructEval->getFirstNestedEvaluation();
+-  //   auto *doStmt = doLoop->getIf<Fortran::parser::NonLabelDoStmt>();
+-  //   assert(doStmt && "Expected do loop to be in the nested evaluation");
+-  //   const auto &loopControl =
+-  //       std::get<std::optional<Fortran::parser::LoopControl>>(doStmt->t);
+-  //   const Fortran::parser::LoopControl::Bounds *bounds =
+-  //       std::get_if<Fortran::parser::LoopControl::Bounds>(&loopControl->u);
+-  //   assert(bounds && "Expected bounds for worksharing do loop");
+-  //   Fortran::lower::StatementContext stmtCtx;
+-  //   lowerBound.push_back(fir::getBase(converter.genExprValue(
+-  //       *Fortran::semantics::GetExpr(bounds->lower), stmtCtx)));
+-  //   upperBound.push_back(fir::getBase(converter.genExprValue(
+-  //       *Fortran::semantics::GetExpr(bounds->upper), stmtCtx)));
+-  //   if (bounds->step) {
+-  //     step.push_back(fir::getBase(converter.genExprValue(
+-  //         *Fortran::semantics::GetExpr(bounds->step), stmtCtx)));
+-  //   } else { // If `step` is not present, assume it as `1`.
+-  //     step.push_back(firOpBuilder.createIntegerConstant(
+-  //         currentLocation, firOpBuilder.getIntegerType(32), 1));
+-  //   }
+-  //   iv.push_back(bounds->name.thing.symbol);
+-  //   loopVarTypeSize = std::max(loopVarTypeSize,
+-  //                              bounds->name.thing.symbol->GetUltimate().size());
+-
+-  //   // collapseValue--;
+-  //   doConstructEval =
+-  //       &*std::next(doConstructEval->getNestedEvaluations().begin());
+-  // } while (doConstructEval != doConstructEval->getNestedEvaluations().end());
+-
+-  // ---------------------------------------------------------------------------
+-
+-
+-
+   LLVM_DEBUG(llvm::dbgs() << "PIM eval begin >>>\n");
+   for (Fortran::lower::pft::Evaluation &e : eval.getNestedEvaluations()) {
+     e.dump();
+-    LLVM_DEBUG(llvm::dbgs() << "e.isActionStmt(): " << e.isActionStmt() << "\n");
+-    // LLVM_DEBUG(assign.lhs.AsFortran(llvm::dbgs() << "PIM candidate: ") << '\n';
++    LLVM_DEBUG(llvm::dbgs()
++               << "e.isActionStmt(): " << e.isActionStmt() << "\n");
++    // LLVM_DEBUG(assign.lhs.AsFortran(llvm::dbgs() << "PIM candidate: ") <<
++    // '\n';
+     //            assign.rhs.AsFortran(llvm::dbgs() << "assign expression: "));
+     if (auto *endDo = e.getIf<Fortran::parser::EndDoStmt>()) {
+       LLVM_DEBUG(llvm::dbgs() << "PIM END DO detected: \n");
+     } else if (auto *endDo = e.getIf<Fortran::parser::NonLabelDoStmt>()) {
+       LLVM_DEBUG(llvm::dbgs() << "PIM NonLabelDoStmt detected: \n");
+-    } else if (auto *assignmentStmt = e.getIf<Fortran::parser::AssignmentStmt>()) {
+-      const Fortran::evaluate::Assignment &assign = *assignmentStmt->typedAssignment->v;
++    } else if (auto *assignmentStmt =
++                   e.getIf<Fortran::parser::AssignmentStmt>()) {
++      const Fortran::evaluate::Assignment &assign =
++          *assignmentStmt->typedAssignment->v;
+ 
+-      LLVM_DEBUG(assign.lhs.AsFortran(llvm::dbgs() << "PIM candidate array: ") << '\n';
++      LLVM_DEBUG(assign.lhs.AsFortran(llvm::dbgs() << "PIM candidate array: ")
++                     << '\n';
+                  assign.rhs.AsFortran(llvm::dbgs() << "assign expression: "));
+       // Proceed in the same way as in genAssgnment
+       std::optional<Fortran::evaluate::DynamicType> lhsType =
+@@ -880,14 +919,15 @@ void Fortran::lower::genPimOperations(
+       // TODO: Check explicitIterationSpace()
+       // if (assign.lhs.Rank() > 0 || explicitIterationSpace()) {
+       if (assign.lhs.Rank() > 0) {
+-        // LLVM_DEBUG(assign.lhs.AsFortran(llvm::dbgs() << "pim array: ") << '\n';
+-        //            assign.rhs.AsFortran(llvm::dbgs() << "assign expression: "));
++        // LLVM_DEBUG(assign.lhs.AsFortran(llvm::dbgs() << "pim array: ") <<
++        // '\n';
++        //            assign.rhs.AsFortran(llvm::dbgs() << "assign expression:
++        //            "));
+         // Array assignment
+         // genArrayAssignment(assign, stmtCtx);
+         // mlir::Location loc = converter.getCurrentLocation();
+         // mlir::Type arrTy = fir::dyn_cast_ptrOrBoxEleTy(lhsType);
+ 
+-
+         // builder.create<mlir::pim::SumOp>(loc, assign.lhs, assign.rhs);
+         return;
+       } else {
+diff --git a/flang/lib/Optimizer/CodeGen/CMakeLists.txt b/flang/lib/Optimizer/CodeGen/CMakeLists.txt
+index 10819ce15203..395c74f3f0d0 100644
+--- a/flang/lib/Optimizer/CodeGen/CMakeLists.txt
++++ b/flang/lib/Optimizer/CodeGen/CMakeLists.txt
+@@ -5,6 +5,7 @@ add_flang_library(FIRCodeGen
+   PreCGRewrite.cpp
+   Target.cpp
+   TargetRewrite.cpp
++  # TypeConverter.cpp
+ 
+   DEPENDS
+   FIRBuilder
+diff --git a/flang/lib/Optimizer/CodeGen/CodeGen.cpp b/flang/lib/Optimizer/CodeGen/CodeGen.cpp
+index a6d07cbd9868..f399fa5755a9 100644
+--- a/flang/lib/Optimizer/CodeGen/CodeGen.cpp
++++ b/flang/lib/Optimizer/CodeGen/CodeGen.cpp
+@@ -861,6 +861,20 @@ struct DispatchOpConversion : public FIROpConversion<fir::DispatchOp> {
+   }
+ };
+ 
++struct CastOpConversion : public FIROpConversion<fir::CastOp> {
++  using FIROpConversion::FIROpConversion;
++
++  mlir::LogicalResult
++  matchAndRewrite(fir::CastOp castOp, OpAdaptor adaptor,
++                  mlir::ConversionPatternRewriter &rewriter) const override {
++    if (castOp.getIn().getType() != convertType(castOp.getType())) {
++      return mlir::failure();
++     }
++    rewriter.replaceOp(castOp, castOp.getIn());
++    return mlir::success();
++  }
++};
++
+ /// Lower `fir.dispatch_table` operation. The dispatch table for a Fortran
+ /// derived type.
+ struct DispatchTableOpConversion
+@@ -3318,7 +3332,8 @@ public:
+         SliceOpConversion, StoreOpConversion, StringLitOpConversion,
+         SubcOpConversion, UnboxCharOpConversion, UnboxProcOpConversion,
+         UndefOpConversion, UnreachableOpConversion, XArrayCoorOpConversion,
+-        XEmboxOpConversion, XReboxOpConversion, ZeroOpConversion>(typeConverter, options);
++        XEmboxOpConversion, XReboxOpConversion, ZeroOpConversion,
++        CastOpConversion>(typeConverter, options);
+     mlir::populateFuncToLLVMConversionPatterns(typeConverter, pattern);
+     mlir::populateOpenMPToLLVMConversionPatterns(typeConverter, pattern);
+     mlir::arith::populateArithmeticToLLVMConversionPatterns(typeConverter,
+diff --git a/flang/lib/Optimizer/CodeGen/DescriptorModel.h b/flang/lib/Optimizer/CodeGen/DescriptorModel.h
+index 0592fea62d15..775fbaca1a72 100644
+--- a/flang/lib/Optimizer/CodeGen/DescriptorModel.h
++++ b/flang/lib/Optimizer/CodeGen/DescriptorModel.h
+@@ -37,70 +37,70 @@ template <typename T>
+ TypeBuilderFunc getModel();
+ 
+ template <>
+-TypeBuilderFunc getModel<void *>() {
++inline TypeBuilderFunc getModel<void *>() {
+   return [](mlir::MLIRContext *context) -> mlir::Type {
+     return mlir::LLVM::LLVMPointerType::get(mlir::IntegerType::get(context, 8));
+   };
+ }
+ template <>
+-TypeBuilderFunc getModel<unsigned>() {
++inline TypeBuilderFunc getModel<unsigned>() {
+   return [](mlir::MLIRContext *context) -> mlir::Type {
+     return mlir::IntegerType::get(context, sizeof(unsigned) * 8);
+   };
+ }
+ template <>
+-TypeBuilderFunc getModel<int>() {
++inline TypeBuilderFunc getModel<int>() {
+   return [](mlir::MLIRContext *context) -> mlir::Type {
+     return mlir::IntegerType::get(context, sizeof(int) * 8);
+   };
+ }
+ template <>
+-TypeBuilderFunc getModel<unsigned long>() {
++inline TypeBuilderFunc getModel<unsigned long>() {
+   return [](mlir::MLIRContext *context) -> mlir::Type {
+     return mlir::IntegerType::get(context, sizeof(unsigned long) * 8);
+   };
+ }
+ template <>
+-TypeBuilderFunc getModel<unsigned long long>() {
++inline TypeBuilderFunc getModel<unsigned long long>() {
+   return [](mlir::MLIRContext *context) -> mlir::Type {
+     return mlir::IntegerType::get(context, sizeof(unsigned long long) * 8);
+   };
+ }
+ template <>
+-TypeBuilderFunc getModel<long long>() {
++inline TypeBuilderFunc getModel<long long>() {
+   return [](mlir::MLIRContext *context) -> mlir::Type {
+     return mlir::IntegerType::get(context, sizeof(long long) * 8);
+   };
+ }
+ template <>
+-TypeBuilderFunc getModel<Fortran::ISO::CFI_rank_t>() {
++inline TypeBuilderFunc getModel<Fortran::ISO::CFI_rank_t>() {
+   return [](mlir::MLIRContext *context) -> mlir::Type {
+     return mlir::IntegerType::get(context,
+                                   sizeof(Fortran::ISO::CFI_rank_t) * 8);
+   };
+ }
+ template <>
+-TypeBuilderFunc getModel<Fortran::ISO::CFI_type_t>() {
++inline TypeBuilderFunc getModel<Fortran::ISO::CFI_type_t>() {
+   return [](mlir::MLIRContext *context) -> mlir::Type {
+     return mlir::IntegerType::get(context,
+                                   sizeof(Fortran::ISO::CFI_type_t) * 8);
+   };
+ }
+ template <>
+-TypeBuilderFunc getModel<long>() {
++inline TypeBuilderFunc getModel<long>() {
+   return [](mlir::MLIRContext *context) -> mlir::Type {
+     return mlir::IntegerType::get(context, sizeof(long) * 8);
+   };
+ }
+ template <>
+-TypeBuilderFunc getModel<Fortran::ISO::CFI_dim_t>() {
++inline TypeBuilderFunc getModel<Fortran::ISO::CFI_dim_t>() {
+   return [](mlir::MLIRContext *context) -> mlir::Type {
+     auto indexTy = getModel<Fortran::ISO::CFI_index_t>()(context);
+     return mlir::LLVM::LLVMArrayType::get(indexTy, 3);
+   };
+ }
+ template <>
+-TypeBuilderFunc
++inline TypeBuilderFunc
+ getModel<Fortran::ISO::cfi_internal::FlexibleArray<Fortran::ISO::CFI_dim_t>>() {
+   return getModel<Fortran::ISO::CFI_dim_t>();
+ }
+diff --git a/flang/lib/Optimizer/Dialect/FIROps.cpp b/flang/lib/Optimizer/Dialect/FIROps.cpp
+index 1c1e1a6e9c7f..dc186e5ea172 100644
+--- a/flang/lib/Optimizer/Dialect/FIROps.cpp
++++ b/flang/lib/Optimizer/Dialect/FIROps.cpp
+@@ -20,6 +20,7 @@
+ #include "mlir/Dialect/CommonFolders.h"
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/IR/BuiltinAttributes.h"
++#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+ #include "mlir/IR/BuiltinOps.h"
+ #include "mlir/IR/Diagnostics.h"
+ #include "mlir/IR/Matchers.h"
+@@ -3563,6 +3564,13 @@ mlir::Type fir::applyPathToType(mlir::Type eleTy, mlir::ValueRange path) {
+   return eleTy;
+ }
+ 
++mlir::LogicalResult fir::CastOp::verify() {
++  if (!llvm::isa<mlir::LLVM::LLVMDialect>(getRes().getType().getDialect()))
++    return emitOpError()
++            << "Result type of fir.cast op must be an LLVMDialect type";
++  return mlir::success();
++}
++
+ // Tablegen operators
+ 
+ #define GET_OP_CLASSES
+diff --git a/flang/lib/Optimizer/Transforms/PimDataOperandConversion.cpp b/flang/lib/Optimizer/Transforms/PimDataOperandConversion.cpp
+index b239c461e899..9857cbfff3a0 100644
+--- a/flang/lib/Optimizer/Transforms/PimDataOperandConversion.cpp
++++ b/flang/lib/Optimizer/Transforms/PimDataOperandConversion.cpp
+@@ -19,12 +19,44 @@
+ 
+ #include "mlir/Dialect/Pim/Pim.h"
+ #include "mlir/Dialect/MemRef/IR/MemRef.h"
+-#include "mlir/Pass/Pass.h"
++// #include "mlir/Pass/Pass.h"
+ #include <mlir/IR/PatternMatch.h>
+ #include <mlir/Support/LogicalResult.h>
++#include "llvm/Support/Debug.h"
++
++#include "PassDetail.h"
++#include "flang/Optimizer/Dialect/FIROps.h"
++#include "flang/Optimizer/Dialect/FIRType.h"
++#include "flang/Optimizer/Transforms/Passes.h"
++// #include "mlir/Conversion/OpenACCToLLVM/ConvertOpenACCToLLVM.h"
++// #include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVM.h"
++#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
++// #include "mlir/Dialect/OpenACC/OpenACC.h"
++#include "mlir/Pass/Pass.h"
++#include "mlir/Transforms/DialectConversion.h"
++
++
++#include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/IR/Dominance.h"
++#include "mlir/IR/Operation.h"
++#include "mlir/Transforms/Passes.h"
++
++#include "flang/Optimizer/Dialect/FIRDialect.h"
++#include "flang/Optimizer/Dialect/FIROps.h"
++#include "flang/Optimizer/Dialect/FIRType.h"
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/Optional.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/Debug.h"
+ 
+ #define DEBUG_TYPE "flang-pim-conversion"
+ #include "../CodeGen/TypeConverter.h"
++// #include "TypeConverter.h"
++
++namespace fir {
++#define GEN_PASS_DEF_PIMFIRDATACONVERSION
++#include "flang/Optimizer/Transforms/Passes.h.inc"
++} // namespace fir
+ 
+ using namespace mlir;
+ 
+@@ -34,19 +66,19 @@ using namespace mlir;
+ 
+ namespace {
+ 
+-class PimArgConversion : public mlir::OpRewritePattern<mlir::pim::AddOpNew> {
+-public:
+-  using OpRewritePattern::OpRewritePattern;
+-  mlir::LogicalResult
+-  matchAndRewrite(mlir::pim::AddOpNew op,
+-                  mlir::PatternRewriter &rewriter) const override {
+-    LLVM_DEBUG(llvm::dbgs() << "PimArgConversion: running on :\n";
+-               op.print(llvm::dbgs()););
+-    // rewriter.replaceOpWithNewOp<fir::AllocaOp>(op, convertMemRef(op.getType()),
+-    //                                            op.memref());
+-    return success();
+-  }
+-};
++// class PimArgConversion : public mlir::OpRewritePattern<mlir::pim::AddOp> {
++// public:
++//   using OpRewritePattern::OpRewritePattern;
++//   mlir::LogicalResult
++//   matchAndRewrite(mlir::pim::AddOp op,
++//                   mlir::PatternRewriter &rewriter) const override {
++//     LLVM_DEBUG(llvm::dbgs() << "PimArgConversion: running on :\n";
++//                op.print(llvm::dbgs()););
++//     // rewriter.replaceOpWithNewOp<fir::AllocaOp>(op, convertMemRef(op.getType()),
++//     //                                            op.memref());
++//     return success();
++//   }
++// };
+ 
+ 
+ // class MangleNameOnCallOp : public mlir::OpRewritePattern<fir::CallOp> {
+@@ -75,19 +107,185 @@ public:
+ 
+ namespace {
+ 
+-// <mlir::pim::AddOpNew>
++// <mlir::pim::AddOp>
+ // template <typename PimOp>
+-class PimArgConvertionToLLVMTypes : public mlir::OpRewritePattern<pim::CreateBufferObject> {
++// template <typename Op>
++// class PimArgConvertionToLLVMTypes : public mlir::OpRewritePattern<pim::CreateBufferObject> {
++// public:
++//   using OpRewritePattern::OpRewritePattern;
++
++//   explicit PimArgConvertionToLLVMTypes(TypeConverter &converter,
++//                                             MLIRContext *ctx)
++//       : OpConversionPattern<Op>(converter, ctx) {}
++
++//   // mlir::LogicalResult
++//   // matchAndRewrite(Op op,
++//   //                 mlir::PatternRewriter &rewriter) const override {
++//   //   LLVM_DEBUG(llvm::dbgs() << "PimArgConvertionToLLVMTypes: running on :\n";
++//   //              op.print(llvm::dbgs()););
++//   //   return success();
++//   // }
++
++//   mlir::LogicalResult
++//   matchAndRewrite(Op op, typename Op::Adaptor adaptor,
++//                   ConversionPatternRewriter &builder) const override {
++//     Location loc = op.getLoc();
++//     fir::LLVMTypeConverter &converter = *static_cast<fir::LLVMTypeConverter *>(
++//         OpConversionPattern<Op>::getTypeConverter());
++//     unsigned numDataOperand = op.getNumDataOperands();
++
++//     // Keep the non data operands without modification.
++//     auto nonDataOperands =
++//         op.getOperands().take_front(op.getOperands().size() - numDataOperand);
++//     llvm::SmallVector<mlir::Value> convertedOperands;
++//     convertedOperands.append(nonDataOperands.begin(), nonDataOperands.end());
++
++//     // Go over the data operand and legalize them for translation.
++//     for (unsigned idx = 0; idx < numDataOperand; ++idx) {
++//       mlir::Value originalDataOperand = op.getDataOperand(idx);
++
++//       //
++//       if (auto refTy =
++//               originalDataOperand.getType().dyn_cast<fir::ReferenceType>()) {
++//         if (refTy.getEleTy().isa<fir::SequenceType>() ||
++//             fir::isa_std_type(refTy.getEleTy())) {
++//           // Basic arrays and scalars are passed as llvm.ptr to the translation.
++//           // Code to compute the size will be generated during the translation.
++//           auto convertedType = converter.convertType(refTy);
++//           auto convertedValue = builder.create<fir::CastOp>(
++//               loc, convertedType, originalDataOperand);
++//           convertedOperands.push_back(convertedValue);
++//         } else if (auto boxTy = refTy.getEleTy().dyn_cast<fir::BoxType>()) {
++//           // BoxType needs more work to extract the correct information.
++//           return builder.notifyMatchFailure(
++//               op, "fir.box type currently not supported");
++
++//           // When a BoxType is encountered we need to push the descriptor and
++//           // the actual data.
++
++//           auto convertedType =
++//               converter.convertType(refTy).cast<mlir::LLVM::LLVMPointerType>();
++//           auto convertedValue =
++//               builder
++//                   .create<fir::CastOp>(loc, convertedType, originalDataOperand)
++//                   .getRes();
++
++//           // // TODO: currently this code is not doing what it should just so dummy
++//           // // code to create and populate the data descriptor with info.
++//           // auto fortranDescriptor =
++//           //     builder.create<LLVM::LoadOp>(loc, convertedValue);
++//           // LLVM::LLVMStructType fortranDescrType =
++//           //     convertedType.getElementType().dyn_cast<LLVM::LLVMStructType>();
++//           // auto descrElementPtr = builder.create<LLVM::ExtractValueOp>(
++//           //     loc, fortranDescrType, fortranDescriptor,
++//           //     builder.getI32ArrayAttr(0));
++
++//           // auto descr =
++//           //     DataDescriptor::undef(builder, loc, fortranDescrType.getBody()[0],
++//           //                           fortranDescrType.getBody()[0]);
++//           // descr.setBasePointer(builder, loc, descrElementPtr);
++//           // descr.setPointer(builder, loc, descrElementPtr);
++//           // // Compute size?
++//           // // descr.setSize(builder, loc, descrElementSize);
++
++//           // convertedOperands.push_back(descr);
++//         }
++//       } else {
++//         // Type not supported.
++//         return builder.notifyMatchFailure(op, "unsupported type");
++//       }
++//     }
++
++//     builder.replaceOpWithNewOp<Op>(op, TypeRange(), convertedOperands,
++//                                    op.getOperation()->getAttrs());
++
++//     return success();
++//   }
++
++// };
++
++template <typename Op>
++class LegalizeDataOpForLLVMTranslation : public OpConversionPattern<Op> {
+ public:
+-  using OpRewritePattern::OpRewritePattern;
++  explicit LegalizeDataOpForLLVMTranslation(TypeConverter &converter,
++                                            MLIRContext *ctx)
++      : OpConversionPattern<Op>(converter, ctx) {}
++
+   mlir::LogicalResult
+-  matchAndRewrite(pim::CreateBufferObject op,
+-                  mlir::PatternRewriter &rewriter) const override {
+-    LLVM_DEBUG(llvm::dbgs() << "PimArgConvertionToLLVMTypes: running on :\n";
+-               op.print(llvm::dbgs()););
++  matchAndRewrite(Op op, typename Op::Adaptor adaptor,
++                  ConversionPatternRewriter &builder) const override {
++    Location loc = op.getLoc();
++    fir::LLVMTypeConverter &converter = *static_cast<fir::LLVMTypeConverter *>(
++        OpConversionPattern<Op>::getTypeConverter());
++    unsigned numDataOperand = op.getNumDataOperands();
++
++    // Keep the non data operands without modification.
++    auto nonDataOperands =
++        op.getOperands().take_front(op.getOperands().size() - numDataOperand);
++    llvm::SmallVector<mlir::Value> convertedOperands;
++    convertedOperands.append(nonDataOperands.begin(), nonDataOperands.end());
++
++    // Go over the data operand and legalize them for translation.
++    for (unsigned idx = 0; idx < numDataOperand; ++idx) {
++      mlir::Value originalDataOperand = op.getDataOperand(idx);
++
++      //
++      if (auto refTy =
++              originalDataOperand.getType().dyn_cast<fir::ReferenceType>()) {
++        if (refTy.getEleTy().isa<fir::SequenceType>() ||
++            fir::isa_std_type(refTy.getEleTy())) {
++          // Basic arrays and scalars are passed as llvm.ptr to the translation.
++          // Code to compute the size will be generated during the translation.
++          auto convertedType = converter.convertType(refTy);
++          auto convertedValue = builder.create<fir::CastOp>(
++              loc, convertedType, originalDataOperand);
++          convertedOperands.push_back(convertedValue);
++        } else if (auto boxTy = refTy.getEleTy().dyn_cast<fir::BoxType>()) {
++          // BoxType needs more work to extract the correct information.
++          return builder.notifyMatchFailure(
++              op, "fir.box type currently not supported");
++
++          // When a BoxType is encountered we need to push the descriptor and
++          // the actual data.
++
++          auto convertedType =
++              converter.convertType(refTy).cast<mlir::LLVM::LLVMPointerType>();
++          auto convertedValue =
++              builder
++                  .create<fir::CastOp>(loc, convertedType, originalDataOperand)
++                  .getRes();
++
++          // // TODO: currently this code is not doing what it should just so dummy
++          // // code to create and populate the data descriptor with info.
++          // auto fortranDescriptor =
++          //     builder.create<LLVM::LoadOp>(loc, convertedValue);
++          // LLVM::LLVMStructType fortranDescrType =
++          //     convertedType.getElementType().dyn_cast<LLVM::LLVMStructType>();
++          // auto descrElementPtr = builder.create<LLVM::ExtractValueOp>(
++          //     loc, fortranDescrType, fortranDescriptor,
++          //     builder.getI32ArrayAttr(0));
++
++          // auto descr =
++          //     DataDescriptor::undef(builder, loc, fortranDescrType.getBody()[0],
++          //                           fortranDescrType.getBody()[0]);
++          // descr.setBasePointer(builder, loc, descrElementPtr);
++          // descr.setPointer(builder, loc, descrElementPtr);
++          // // Compute size?
++          // // descr.setSize(builder, loc, descrElementSize);
++
++          // convertedOperands.push_back(descr);
++        }
++      } else {
++        // Type not supported.
++        return builder.notifyMatchFailure(op, "unsupported type");
++      }
++    }
++
++    builder.replaceOpWithNewOp<Op>(op, TypeRange(), convertedOperands,
++                                   op.getOperation()->getAttrs());
++
+     return success();
+   }
+-
+ };
+ 
+ 
+@@ -95,20 +293,29 @@ public:
+ class ConvertPimToLLVMPass
+     : public fir::PimFirDataConversionBase<ConvertPimToLLVMPass> {
+ public:
+-  // mlir::ModuleOp getModule() { return getOperation(); }
++  mlir::ModuleOp getModule() { return getOperation(); }
+   void runOnOperation() override {
++
++    auto op = getOperation();
+     auto *context = &getContext();
+-    auto function = getOperation();
+-    LLVM_DEBUG(llvm::dbgs() << "ConvertPimToLLVMPass: running on function:\n";
+-               function.print(llvm::dbgs()););
++
++    LLVM_DEBUG(llvm::dbgs() << "ConvertPimToLLVMPass: running on :\n";
++               op.print(llvm::dbgs()););
++
+     mlir::RewritePatternSet patterns(context);
+-    patterns.insert<PimArgConvertionToLLVMTypes>(context);
++
++    fir::LLVMTypeConverter converter{getModule()};
++    // patterns.add<LegalizeDataOpForLLVMTranslation<mlir::pim::ParallelOp>>(converter, context);
++    // patterns.add<LegalizeDataOpForLLVMTranslation<mlir::pim::CreateBufferObject>>(converter, context);
++    // patterns.add<LegalizeDataOpForLLVMTranslation<mlir::pim::AddOp>>(converter, context);
++    // patterns.add<LegalizeDataOpForLLVMTranslation<mlir::pim::UnwrapBufferObject>>(converter, context);
+ 
+     mlir::ConversionTarget target(*context);
+     target.addLegalDialect<mlir::pim::PimDialect, fir::FIROpsDialect,
++                           LLVM::LLVMDialect,
+                            mlir::arith::ArithmeticDialect,
+                            mlir::func::FuncDialect>();
+-    if (mlir::failed(mlir::applyPartialConversion(function, target,
++    if (mlir::failed(mlir::applyPartialConversion(op, target,
+                                                   std::move(patterns)))) {
+       mlir::emitError(mlir::UnknownLoc::get(context),
+                       "error in converting pim dialect\n");
+@@ -123,3 +330,203 @@ public:
+ std::unique_ptr<mlir::Pass> fir::createPimDataOperandConversionPass() {
+   return std::make_unique<ConvertPimToLLVMPass>();
+ }
++
++
++// //===- OpenACCDataOperandConversion.cpp -- convert OpenACC data operand -*-===//
++// //
++// // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// // See https://llvm.org/LICENSE.txt for license information.
++// // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// //
++// //===----------------------------------------------------------------------===//
++
++// #include "PassDetail.h"
++// #include "flang/Optimizer/Dialect/FIROps.h"
++// #include "flang/Optimizer/Dialect/FIRType.h"
++// #include "flang/Optimizer/Transforms/Passes.h"
++// #include "mlir/Conversion/OpenACCToLLVM/ConvertOpenACCToLLVM.h"
++// #include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVM.h"
++// #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
++// #include "mlir/Dialect/OpenACC/OpenACC.h"
++// #include "mlir/Pass/Pass.h"
++// #include "mlir/Transforms/DialectConversion.h"
++
++// #define DEBUG_TYPE "flang-openacc-conversion"
++// #include "../CodeGen/TypeConverter.h"
++
++// using namespace mlir;
++
++// //===----------------------------------------------------------------------===//
++// // Conversion patterns
++// //===----------------------------------------------------------------------===//
++
++// namespace {
++
++// template <typename Op>
++// class LegalizeDataOpForLLVMTranslation : public OpConversionPattern<Op> {
++// public:
++//   explicit LegalizeDataOpForLLVMTranslation(TypeConverter &converter,
++//                                             MLIRContext *ctx)
++//       : OpConversionPattern<Op>(converter, ctx) {}
++
++//   mlir::LogicalResult
++//   matchAndRewrite(Op op, typename Op::Adaptor adaptor,
++//                   ConversionPatternRewriter &builder) const override {
++//     Location loc = op.getLoc();
++//     fir::LLVMTypeConverter &converter = *static_cast<fir::LLVMTypeConverter *>(
++//         OpConversionPattern<Op>::getTypeConverter());
++//     unsigned numDataOperand = op.getNumDataOperands();
++
++//     // Keep the non data operands without modification.
++//     auto nonDataOperands =
++//         op.getOperands().take_front(op.getOperands().size() - numDataOperand);
++//     llvm::SmallVector<mlir::Value> convertedOperands;
++//     convertedOperands.append(nonDataOperands.begin(), nonDataOperands.end());
++
++//     // Go over the data operand and legalize them for translation.
++//     for (unsigned idx = 0; idx < numDataOperand; ++idx) {
++//       mlir::Value originalDataOperand = op.getDataOperand(idx);
++
++//       //
++//       if (auto refTy =
++//               originalDataOperand.getType().dyn_cast<fir::ReferenceType>()) {
++//         if (refTy.getEleTy().isa<fir::SequenceType>() ||
++//             fir::isa_std_type(refTy.getEleTy())) {
++//           // Basic arrays and scalars are passed as llvm.ptr to the translation.
++//           // Code to compute the size will be generated during the translation.
++//           auto convertedType = converter.convertType(refTy);
++//           auto convertedValue = builder.create<fir::CastOp>(
++//               loc, convertedType, originalDataOperand);
++//           convertedOperands.push_back(convertedValue);
++//         } else if (auto boxTy = refTy.getEleTy().dyn_cast<fir::BoxType>()) {
++//           // BoxType needs more work to extract the correct information.
++//           return builder.notifyMatchFailure(
++//               op, "fir.box type currently not supported");
++
++//           // When a BoxType is encountered we need to push the descriptor and
++//           // the actual data.
++
++//           auto convertedType =
++//               converter.convertType(refTy).cast<mlir::LLVM::LLVMPointerType>();
++//           auto convertedValue =
++//               builder
++//                   .create<fir::CastOp>(loc, convertedType, originalDataOperand)
++//                   .getRes();
++
++//           // TODO: currently this code is not doing what it should just so dummy
++//           // code to create and populate the data descriptor with info.
++//           auto fortranDescriptor =
++//               builder.create<LLVM::LoadOp>(loc, convertedValue);
++//           LLVM::LLVMStructType fortranDescrType =
++//               convertedType.getElementType().dyn_cast<LLVM::LLVMStructType>();
++//           auto descrElementPtr = builder.create<LLVM::ExtractValueOp>(
++//               loc, fortranDescrType, fortranDescriptor,
++//               builder.getI32ArrayAttr(0));
++
++//           auto descr =
++//               DataDescriptor::undef(builder, loc, fortranDescrType.getBody()[0],
++//                                     fortranDescrType.getBody()[0]);
++//           descr.setBasePointer(builder, loc, descrElementPtr);
++//           descr.setPointer(builder, loc, descrElementPtr);
++//           // Compute size?
++//           // descr.setSize(builder, loc, descrElementSize);
++
++//           convertedOperands.push_back(descr);
++//         }
++//       } else {
++//         // Type not supported.
++//         return builder.notifyMatchFailure(op, "unsupported type");
++//       }
++//     }
++
++//     builder.replaceOpWithNewOp<Op>(op, TypeRange(), convertedOperands,
++//                                    op.getOperation()->getAttrs());
++
++//     return success();
++//   }
++// };
++// } // namespace
++
++// namespace {
++// class ConvertOpenACCToLLVMPass
++//     : public fir::OpenACCFirDataConversionBase<ConvertOpenACCToLLVMPass> {
++// public:
++//   mlir::ModuleOp getModule() { return getOperation(); }
++//   void runOnOperation() override;
++// };
++// } // namespace
++
++// void ConvertOpenACCToLLVMPass::runOnOperation() {
++//   auto op = getOperation();
++//   auto *context = &getContext();
++
++//   // Convert to OpenACC operations with LLVM IR dialect
++//   RewritePatternSet patterns(context);
++//   fir::LLVMTypeConverter converter{getModule()};
++
++//   // patterns.add<LegalizeDataOpForLLVMTranslation<acc::DataOp>>(converter,
++//   // context);
++//   patterns.add<LegalizeDataOpForLLVMTranslation<acc::EnterDataOp>>(converter,
++//                                                                    context);
++//   patterns.add<LegalizeDataOpForLLVMTranslation<acc::ExitDataOp>>(converter,
++//                                                                   context);
++//   // patterns.add<LegalizeDataOpForLLVMTranslation<acc::ParallelOp>>(converter,
++//   // context);
++//   // patterns.add<LegalizeDataOpForLLVMTranslation<acc::UpdateOp>>(converter,
++//   // context);
++
++//   ConversionTarget target(*context);
++//   target.addLegalDialect<fir::FIROpsDialect, LLVM::LLVMDialect>();
++
++//   auto allDataOperandsAreConverted = [](ValueRange operands) {
++//     for (mlir::Value operand : operands) {
++//       if (!DataDescriptor::isValid(operand) &&
++//           !operand.getType().isa<LLVM::LLVMPointerType>())
++//         return false;
++//     }
++//     return true;
++//   };
++
++//   // target.addDynamicallyLegalOp<acc::DataOp>(
++//   //     [allDataOperandsAreConverted](acc::DataOp op) {
++//   //       return allDataOperandsAreConverted(op.copyOperands()) &&
++//   //              allDataOperandsAreConverted(op.copyinOperands()) &&
++//   //              allDataOperandsAreConverted(op.copyinReadonlyOperands()) &&
++//   //              allDataOperandsAreConverted(op.copyoutOperands()) &&
++//   //              allDataOperandsAreConverted(op.copyoutZeroOperands()) &&
++//   //              allDataOperandsAreConverted(op.createOperands()) &&
++//   //              allDataOperandsAreConverted(op.createZeroOperands()) &&
++//   //              allDataOperandsAreConverted(op.noCreateOperands()) &&
++//   //              allDataOperandsAreConverted(op.presentOperands()) &&
++//   //              allDataOperandsAreConverted(op.deviceptrOperands()) &&
++//   //              allDataOperandsAreConverted(op.attachOperands());
++//   //     });
++
++//   target.addDynamicallyLegalOp<acc::EnterDataOp>(
++//       [allDataOperandsAreConverted](acc::EnterDataOp op) {
++//         return allDataOperandsAreConverted(op.copyinOperands()) &&
++//                allDataOperandsAreConverted(op.createOperands()) &&
++//                allDataOperandsAreConverted(op.createZeroOperands()) &&
++//                allDataOperandsAreConverted(op.attachOperands());
++//       });
++
++//   target.addDynamicallyLegalOp<acc::ExitDataOp>(
++//       [allDataOperandsAreConverted](acc::ExitDataOp op) {
++//         return allDataOperandsAreConverted(op.copyoutOperands()) &&
++//                allDataOperandsAreConverted(op.deleteOperands()) &&
++//                allDataOperandsAreConverted(op.detachOperands());
++//       });
++
++//   // target.addDynamicallyLegalOp<acc::UpdateOp>(
++//   //     [allDataOperandsAreConverted](acc::UpdateOp op) {
++//   //       return allDataOperandsAreConverted(op.hostOperands()) &&
++//   //              allDataOperandsAreConverted(op.deviceOperands());
++//   //     });
++
++//   if (failed(applyPartialConversion(op, target, std::move(patterns))))
++//     signalPassFailure();
++// }
++
++// std::unique_ptr<mlir::Pass> fir::createOpenACCDataOperandConversionPass() {
++//   return std::make_unique<ConvertOpenACCToLLVMPass>();
++// }
+diff --git a/flang/lib/Semantics/canonicalize-pim.cpp b/flang/lib/Semantics/canonicalize-pim.cpp
+index d069f27584cf..b294d349756c 100644
+--- a/flang/lib/Semantics/canonicalize-pim.cpp
++++ b/flang/lib/Semantics/canonicalize-pim.cpp
+@@ -65,33 +65,6 @@ public:
+     // | | | | | | | | | | DataRef -> Name = 'b'
+     // | | | | | | | | | | SectionSubscript -> Integer -> Expr = 'i'
+     // | | | | | | | | | | | Designator -> DataRef -> Name = 'i'
+-
+-    // for (parser::ExecutionPartConstruct &epc :
+-    //     std::get<parser::Block>(doCons.t)) {
+-    //   LLVM_DEBUG(llvm::dbgs() << "----> ExecutionPartConstruct iter\n");
+-    //   if (auto *executableCons{common::Unwrap<parser::ExecutableConstruct>(epc.u)}) {
+-    //     LLVM_DEBUG(llvm::dbgs() << "------> ExecutableConstruct iter\n");
+-
+-    //     if (auto *actionStmt{
+-    //         common::Unwrap<parser::Statement<parser::ActionStmt>>(executableCons->u)}) {
+-    //       LLVM_DEBUG(llvm::dbgs() << "--------> ActionStmt iter\n");
+-    //       // if (auto *assignmentStmt{parser::Unwrap<common::Indirection<parser::AssignmentStmt>>(actionStmt->statement.u)}) {
+-    //       if (auto *assignmentStmt{parser::Unwrap<parser::AssignmentStmt>(actionStmt->statement.u)}) {
+-    //         LLVM_DEBUG(llvm::dbgs() << "----------> AssignmentStmt iter\n");
+-
+-    //         parser::Variable &var{std::get<parser::Variable>(assignmentStmt->t)};
+-    //         parser::Expr &expr{std::get<parser::Expr>(assignmentStmt->t)};
+-    //         if (auto *addExpr{parser::Unwrap<parser::Expr::Add>(expr.u)}) {
+-    //           // parser::PimAdd pimAdd{
+-    //           //   std::make_tuple(std::move(var), std::move(expr))};
+-    //           LLVM_DEBUG(llvm::dbgs() << "--> rewrite Add in PIM\n");
+-    //           auto x = std::move(epc);
+-    //           (void)x;
+-    //         }
+-    //       }
+-    //     }
+-    //   }
+-    // }
+     parser::Block& doBlock{std::get<parser::Block>(doCons.t)};
+     parser::Block::iterator next{doBlock.begin()};
+     // iterate list of ExecutionPartConstruct in DoConstruct block
+@@ -120,26 +93,29 @@ public:
+               parser::PimAdd pimAdd{
+                 std::make_tuple(std::move(var), std::move(expr))};
+               LLVM_DEBUG(llvm::dbgs() << "--> rewrite Add in PIM\n");
+-              // removed = true;
+-
+               parser::PimOperation pimOp{std::move(pimAdd)};
+-              // executableCons->u = std::move(pimOp);
+-
+               doBlock.erase(next++);
+               doBlock.insert(next,
+                   parser::ExecutionPartConstruct{
+                       parser::ExecutableConstruct{std::move(pimOp)}});
+               return true;
+-
+-              // doBlock.insert(next, pimOp);
+-              // auto x = std::move(epc);
+-              // (void)x;
++            } else if (auto *mulExpr{
++                           parser::Unwrap<parser::Expr::Multiply>(expr.u)}) {
++              parser::PimMul pimMul{
++                  std::make_tuple(std::move(var), std::move(expr))};
++              LLVM_DEBUG(llvm::dbgs() << "--> rewrite Mul in PIM\n");
++              parser::PimOperation pimOp{std::move(pimMul)};
++              doBlock.erase(next++);
++              doBlock.insert(next,
++                  parser::ExecutionPartConstruct{
++                      parser::ExecutableConstruct{std::move(pimOp)}});
++              return true;
+             }
+           }
+         }
+       }
+       if (!removed) {
+-      ++next;
++        ++next;
+       }
+     }
+ 
+diff --git a/mlir/include/mlir/Dialect/Pim/PimOps.td b/mlir/include/mlir/Dialect/Pim/PimOps.td
+index 167710d39c47..cf578c09f063 100644
+--- a/mlir/include/mlir/Dialect/Pim/PimOps.td
++++ b/mlir/include/mlir/Dialect/Pim/PimOps.td
+@@ -107,17 +107,6 @@ def Pim_SumOp : Pim_Op<"sum", [NoSideEffect,
+   let assemblyFormat = "$lhs `,` $rhs  attr-dict `:` type($result)";
+ }
+ 
+-def Pim_MulOp : Pim_Op<"mul", [NoSideEffect,
+-  SameOperandsAndResultType, Commutative]> {
+-  let summary = "Mul op";
+-  let description = [{
+-    `pim.mul` op
+-  }];
+-  let arguments = (ins F<16>:$lhs, F<16>:$rhs);
+-  let results = (outs F<16>:$result);
+-  let assemblyFormat = "$lhs `,` $rhs  attr-dict `:` type($result)";
+-}
+-
+ def Pim_CreateBoOp : Pim_Op<"create_bo", [NoSideEffect]> {
+   let summary = "Create Pim buffer object";
+   // TODO:
+@@ -148,7 +137,7 @@ def Pim_CopyMemoryOp : Pim_Op<"memcpy", [NoSideEffect]> {
+ 
+ def IntOrIndex : AnyTypeOf<[AnyInteger, Index]>;
+ 
+-def Pim_AddOpNew : Pim_Op<"add_new"> {
++def Pim_AddOp : Pim_Op<"add"> {
+   // let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$lhs,
+   //                      Arg<AnyMemRef, "", [MemRead]>:$rhs);
+   //                      // Arg<Pim_BufferType, "", [MemWrite]>:$result);
+@@ -165,6 +154,13 @@ def Pim_AddOpNew : Pim_Op<"add_new"> {
+   let assemblyFormat = "$lhs `,` $rhs `,` $result  attr-dict `:` `(`type($lhs) `,` type($rhs) `:` type($result)`)`";
+ }
+ 
++def Pim_MulOp : Pim_Op<"mul"> {
++  let arguments = (ins Arg<Pim_BufferType, "", [MemRead]>:$lhs,
++                       Arg<Pim_BufferType, "", [MemRead]>:$rhs,
++                       Arg<Pim_BufferType, "", [MemWrite]>:$result);
++  let assemblyFormat = "$lhs `,` $rhs `,` $result  attr-dict `:` `(`type($lhs) `,` type($rhs) `:` type($result)`)`";
++}
++
+ def Pim_CreateBufferObject : Pim_Op<"create_buffer"> {
+   // TODO: Need operand converstion pass to specify memrefs (covnert fir ptrs to mlir ptrs)
+   // let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$obj);
+@@ -183,28 +179,6 @@ def Pim_UnwrapBufferObject : Pim_Op<"unwrap_buffer"> {
+   let assemblyFormat = "$obj $result attr-dict `:` type($obj) type($result)";
+ }
+ 
+-def Pim_AddOp : Pim_Op<"add"> {
+-  let summary = "pim add operation";
+-  // let arguments = (ins VectorOfRankAndType<[2], [F16, I8]>:$input1,
+-  //                      VectorOfRankAndType<[2], [F16, I8]>:$input2);
+-  // let results = (outs VectorOfRankAndType<[2], [F16, I8]>:$result);
+-
+-  let arguments = (ins F<16>:$lhs, F<16>:$rhs);
+-  let results = (outs F<16>:$result);
+-
+-  // let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$lhs, Arg<AnyMemRef, "", [MemRead]>:$rhs);
+-  // let results = (outs Arg<AnyMemRef, "", [MemWrite]>:$result);
+-
+-  let assemblyFormat = "$lhs `,` $rhs  attr-dict `:` type($result)";
+-
+-  // let builders = [
+-  //   OpBuilder<(ins "Value":$element, "Type":$aggregateType),
+-  //   [{ build($_builder, $_state, aggregateType, element); }]>];
+-
+-  // let assemblyFormat = "$input1 `,` $input2  attr-dict `:` type($result)";
+-  let hasCustomAssemblyFormat = 1;
+-}
+-
+ def Pim_ParallelOp : Pim_Op<"parallel",
+     [AttrSizedOperandSegments]
+     // TODO(mike): check traits: IsolatedFromAbove,
+@@ -265,8 +239,6 @@ def Pim_FInitOp : Pim_Op<"finit", [NoSideEffect]> {
+ //   // let parameters = (ins
+ // }
+ 
+-
+-
+ def MEM_FLAG_ELT_OP: I32EnumAttrCase<"ELT_OP", 1>;
+ def MEM_FLAG_GEMV_INPUT: I32EnumAttrCase<"GEMV_INPUT", 2>;
+ def MEM_FLAG_GEMV_WEIGHT: I32EnumAttrCase<"GEMV_WEIGHT", 3>;
+diff --git a/mlir/lib/Dialect/Pim/IR/Pim.cpp b/mlir/lib/Dialect/Pim/IR/Pim.cpp
+index 4b78f237726b..0a1fd0e17e93 100644
+--- a/mlir/lib/Dialect/Pim/IR/Pim.cpp
++++ b/mlir/lib/Dialect/Pim/IR/Pim.cpp
+@@ -280,6 +280,18 @@ unsigned ParallelOp::getNumDataOperands() {
+   return copyinOperands().size() + copyoutOperands().size();
+ }
+ 
++Value ParallelOp::getDataOperand(unsigned i) {
++  unsigned numOptional = 0;
++  // unsigned numOptional = async() ? 1 : 0;
++  // numOptional += numGangs() ? 1 : 0;
++  // numOptional += numWorkers() ? 1 : 0;
++  // numOptional += vectorLength() ? 1 : 0;
++  // numOptional += ifCond() ? 1 : 0;
++  // numOptional += selfCond() ? 1 : 0;
++  return getOperand(// waitOperands().size() +
++                    numOptional + i);
++}
++
+ #define GET_OP_CLASSES
+ #include "mlir/Dialect/Pim/PimOps.cpp.inc"
+ 
+-- 
+2.17.1
+
