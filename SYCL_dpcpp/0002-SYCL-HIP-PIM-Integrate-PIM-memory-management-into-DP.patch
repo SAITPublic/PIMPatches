@@ -1,0 +1,1676 @@
+From ec4ee97e7178f89527693b11aa2c315e83c6aa70 Mon Sep 17 00:00:00 2001
+From: Lukas Sommer <lukas.sommer@codeplay.com>
+Date: Tue, 24 May 2022 15:03:52 +0000
+Subject: [PATCH 02/17] [SYCL][HIP][PIM] Integrate PIM memory management into
+ DPC++ HIP PI;
+
+Integrate PIM SDK memory management, i.e., creation of buffer objects
+and data movement between different places into the DPC++ HIP PI plugin;
+
+The implementation uses the existing DPC++ PI functions,
+additional information is transported through the existing
+parameter for properties;
+---
+ sycl/include/CL/sycl/detail/pi.h           |  24 +
+ sycl/plugins/hip/CMakeLists.txt            |  23 +
+ sycl/plugins/hip/pi_hip.cpp                | 577 +++++++++++++++++++--
+ sycl/plugins/hip/pi_hip.hpp                | 160 +++++-
+ sycl/unittests/pi/CMakeLists.txt           |   4 +
+ sycl/unittests/pi/pim/CMakeLists.txt       |  25 +
+ sycl/unittests/pi/pim/test_pim_mem_obj.cpp | 448 ++++++++++++++++
+ 7 files changed, 1223 insertions(+), 38 deletions(-)
+ create mode 100644 sycl/unittests/pi/pim/CMakeLists.txt
+ create mode 100644 sycl/unittests/pi/pim/test_pim_mem_obj.cpp
+
+diff --git a/sycl/include/CL/sycl/detail/pi.h b/sycl/include/CL/sycl/detail/pi.h
+index fb6fc91d75ae..0d0184441e32 100644
+--- a/sycl/include/CL/sycl/detail/pi.h
++++ b/sycl/include/CL/sycl/detail/pi.h
+@@ -117,6 +117,8 @@ typedef enum {
+   PI_IMAGE_FORMAT_NOT_SUPPORTED = CL_IMAGE_FORMAT_NOT_SUPPORTED,
+   PI_MEM_OBJECT_ALLOCATION_FAILURE = CL_MEM_OBJECT_ALLOCATION_FAILURE,
+   PI_LINK_PROGRAM_FAILURE = CL_LINK_PROGRAM_FAILURE,
++  PI_PIM_SDK_ERROR = -996, /// < PI_PIM_SDK_ERROR indicates an error occured
++                           /// when calling come function from the PIM SDK.
+   PI_COMMAND_EXECUTION_FAILURE =
+       -997, ///< PI_COMMAND_EXECUTION_FAILURE indicates an error occurred
+             ///< during command enqueue or execution.
+@@ -535,6 +537,23 @@ typedef enum {
+   PI_SAMPLER_FILTER_MODE_LINEAR = CL_FILTER_LINEAR,
+ } _pi_sampler_filter_mode;
+ 
++typedef enum {
++  PI_PIM_ELT_OP = 1,
++  PI_PIM_GEMV_INPUT = 2,
++  PI_PIM_GEMV_WEIGHT = 3,
++  PI_PIM_GEMV_OUTPUT = 4,
++  PI_PIM_GEMV_WEIGHT_T = 5
++} _pi_pim_mem_flag;
++
++typedef enum {
++  PI_PIM_OP_GEMV = 1,
++  PI_PIM_OP_ELT_ADD = 2,
++  PI_PIM_OP_ELT_MUL = 3,
++  PI_PIM_OP_RELU = 4,
++  PI_PIM_OP_BN = 5,
++  PI_PIM_OP_COPY = 6
++} _pi_pim_op_type;
++
+ using pi_context_properties = intptr_t;
+ 
+ using pi_device_exec_capabilities = pi_bitfield;
+@@ -598,6 +617,9 @@ using pi_mem_properties = pi_bitfield;
+ constexpr pi_mem_properties PI_MEM_PROPERTIES_CHANNEL = CL_MEM_CHANNEL_INTEL;
+ constexpr pi_mem_properties PI_MEM_PROPERTIES_ALLOC_BUFFER_LOCATION =
+     CL_MEM_ALLOC_BUFFER_LOCATION_INTEL;
++constexpr pi_mem_properties PI_MEM_PROPERTIES_PIM_DIMENSIONS = 0x9901;
++constexpr pi_mem_properties PI_MEM_PROPERTIES_PIM_OP_TYPE = 0x9902;
++constexpr pi_mem_properties PI_MEM_PROPERTIES_PIM_MEM_FLAG = 0x9903;
+ 
+ // NOTE: this is made 64-bit to match the size of cl_mem_properties_intel to
+ // make the translation to OpenCL transparent.
+@@ -655,6 +677,8 @@ using pi_program_build_info = _pi_program_build_info;
+ using pi_program_build_status = _pi_program_build_status;
+ using pi_kernel_info = _pi_kernel_info;
+ using pi_profiling_info = _pi_profiling_info;
++using pi_pim_mem_flag = _pi_pim_mem_flag;
++using pi_pim_op_type = _pi_pim_op_type;
+ 
+ // For compatibility with OpenCL define this not as enum.
+ using pi_device_partition_property = intptr_t;
+diff --git a/sycl/plugins/hip/CMakeLists.txt b/sycl/plugins/hip/CMakeLists.txt
+index 5106a6901073..c2f0ba4ba9c3 100644
+--- a/sycl/plugins/hip/CMakeLists.txt
++++ b/sycl/plugins/hip/CMakeLists.txt
+@@ -11,6 +11,15 @@ option(SYCL_HIP_PI_ENABLE_PIM "Enable PIM support in the HIP PI plugin" ON)
+ # non-AMD machines.
+ option(SYCL_HIP_PI_STANDALONE_PIM "Enable PIM on non-AMD machines" OFF)
+ 
++# The following option can be used to replace the PIM SDK with a mock-up
++# library for development purposes.
++option(SYCL_HIP_PI_PIM_MOCK_LIBRARY "Replace PIM SDK with mock-up library" ON)
++
++# The following variable can be set by the user to provide the location
++# of the PIM SDK library.
++set(SYCL_BUILD_PI_HIP_PIM_SDK_DIR "/opt/rocm/pim" CACHE STRING 
++    "Directory containing the PIM SDK library")
++
+ # Set default HIP include dirs
+ set(SYCL_BUILD_PI_HIP_INCLUDE_DIR "/opt/rocm/hip/include" CACHE STRING "HIP include dir")
+ set(SYCL_BUILD_PI_HIP_HSA_INCLUDE_DIR "/opt/rocm/hsa/include" CACHE STRING "HSA include dir")
+@@ -89,4 +98,18 @@ if(SYCL_HIP_PI_ENABLE_PIM)
+     # Development version on non-AMD machines
+     target_compile_definitions(pi_hip PRIVATE __HIP_STANDALONE_PIM__)
+   endif()
++
++  # Link either against the mock-up library (PIMMock) or the actual PIM SDK.
++  if(SYCL_HIP_PI_PIM_MOCK_LIBRARY) 
++    # When building on non-AMD machines, always use the PIM mock library
++    # in place of the PIM SDK
++    find_package(PIMMock REQUIRED
++                  PATHS "${SYCL_BUILD_PI_HIP_PIM_SDK_DIR}")
++
++    target_link_libraries(pi_hip PRIVATE PIMMock)
++  else()
++    # TODO(Lukas): Link against the actual PIM SDK once we can test the 
++    # setup on an actual AMD/HIP machine.
++    message(FATAL_ERROR "Linking against PIM SDK not yet supported on HIP machines")
++  endif()
+ endif()
+diff --git a/sycl/plugins/hip/pi_hip.cpp b/sycl/plugins/hip/pi_hip.cpp
+index dd31a322f282..611189091fb2 100644
+--- a/sycl/plugins/hip/pi_hip.cpp
++++ b/sycl/plugins/hip/pi_hip.cpp
+@@ -192,6 +192,43 @@ pi_result check_error(hipError_t result, const char *function, int line,
+ /// \cond NODOXY
+ #define PI_CHECK_ERROR(result) check_error(result, __func__, __LINE__, __FILE__)
+ 
++#ifdef __HIP_ENABLE_PIM__
++
++/// Converts PIM SDK error into PI error code, and outputs error information to
++/// std::err. If PI_HIP_ABORT env variable is defined, it aborts directly
++/// instead of throwing the error. This is intended for debugging purposes.
++/// \return PI_SUCCESS if \param result was hipSuccess.
++/// \throw pi_error exception (integer) if input was not success.
++///
++pi_result check_pim_error(int result, const char *function, int line,
++                          const char *file) {
++  if (result == 0) {
++    // PIM SDK does not define a name for that, but 0 is used to indicate
++    // success.
++    return PI_SUCCESS;
++  }
++
++  // PIM SDK does not expose an interface to get more information, such as a
++  // description or name, about the error.
++  std::cerr << "\nPI HIP PIM SDK ERROR:"
++            << "\n\tValue:           " << result
++            << "\n\tFunction:        " << function
++            << "\n\tSource Location: " << file << ":" << line << "\n"
++            << std::endl;
++
++  if (std::getenv("PI_HIP_ABORT") != nullptr) {
++    std::abort();
++  }
++
++  throw PI_PIM_SDK_ERROR;
++}
++
++/// \cond NODOXY
++#define CHECK_PIM_ERROR(result)                                                \
++  check_pim_error(result, __func__, __LINE__, __FILE__)
++
++#endif // __HIP_ENABLE_PIM__
++
+ /// RAII type to guarantee recovering original HIP context
+ /// Scoped context is used across all PI HIP plugin implementation
+ /// to activate the PI Context on the current thread, matching the
+@@ -212,6 +249,17 @@ public:
+ 
+     hipCtx_t desired = placedContext_->get();
+     PI_CHECK_ERROR(hipCtxGetCurrent(&original_));
++
++#ifdef __HIP_ENABLE_PIM__
++    if (placedContext_->get_device()->is_pim_device()) {
++      hipDevice_t device;
++      PI_CHECK_ERROR(hipCtxGetDevice(&device));
++      assert((device == placedContext_->get_device()->get_underlying()) &&
++             "Activated device does not match PIM underlying device");
++      CHECK_PIM_ERROR(PimSetDevice(device));
++    }
++#endif // __HIP_ENABLE_PIM__
++
+     if (original_ != desired) {
+       // Sets the desired context as the active one for the thread
+       PI_CHECK_ERROR(hipCtxSetCurrent(desired));
+@@ -231,6 +279,13 @@ public:
+   ~ScopedContext() {
+     if (needToRecover_) {
+       PI_CHECK_ERROR(hipCtxSetCurrent(original_));
++#ifdef __HIP_ENABLE_PIM__
++      if (placedContext_->get_device()->is_pim_device()) {
++        hipDevice_t device;
++        PI_CHECK_ERROR(hipCtxGetDevice(&device));
++        CHECK_PIM_ERROR(PimSetDevice(device));
++      }
++#endif // __HIP_ENABLE_PIM__
+     }
+   }
+ };
+@@ -667,13 +722,36 @@ public:
+   void dismiss() { Captive = nullptr; }
+ };
+ 
++#ifdef __HIP_ENABLE_PIM__
++namespace {
++
++/// Get the underlying device of the PIM device, i.e., the device containing the
++/// PIM blocks.
++int pimGetUnderlyingDevice() {
++  // Currently, the PIM SDK has no device detection API to find the underlying
++  // device or detect if a HIP GPU device contains PIM blocks. Therefore, we
++  // assume a single HIP device and return this default device as the underlying
++  // device of PIM.
++  int numHIPDevices = 0;
++  PI_CHECK_ERROR(hipGetDeviceCount(&numHIPDevices));
++  assert(numHIPDevices == 1 && "Expecting only a single HIP device for PIM");
++  // Get the default HIP device
++  int defaultDevice = 0;
++  PI_CHECK_ERROR(hipGetDevice(&defaultDevice));
++  return defaultDevice;
++}
++
++} // anonymous namespace
++
++#endif // __HIP_ENABLE_PIM__
++
+ //-- PI API implementation
+ extern "C" {
+ 
+ /// Obtains the HIP platform.
+ /// There is only one HIP platform, and contains all devices on the system.
+-/// Triggers the HIP Driver initialization (hipInit) the first time, so this
+-/// must be the first PI API called.
++/// Triggers the HIP Driver initialization (hipInit) and PIM SDK initialization
++/// (PimInitialize) the first time, so this must be the first PI API called.
+ ///
+ /// However because multiple devices in a context is not currently supported,
+ /// place each device in a separate platform.
+@@ -702,6 +780,11 @@ pi_result hip_piPlatformsGet(pi_uint32 num_entries, pi_platform *platforms,
+             numPlatforms = 0;
+             return;
+           }
++#ifdef __HIP_ENABLE_PIM__
++          // Initialize the PIM runtime here.
++          err = CHECK_PIM_ERROR(PimInitialize(RT_TYPE_HIP, PIM_FP16));
++#endif // __HIP_ENABLE_PIM__
++
+           int numDevices = 0;
+ #ifndef __HIP_STANDALONE_PIM__
+           hipError_t hipErrorCode = hipGetDeviceCount(&numDevices);
+@@ -741,8 +824,12 @@ pi_result hip_piPlatformsGet(pi_uint32 num_entries, pi_platform *platforms,
+             // PIM is present and add a device for PIM.
+             // To obtain a unique device ID, add one to the max device ID.
+             hipDevice_t pimDevice = maxDeviceId + 1;
+-            platformIds[numDevices].devices_.emplace_back(
+-                new _pi_device{pimDevice, &platformIds[numDevices], true});
++            // PIM is not a standalone device, but functional units in an
++            // underlying HIP device (GPU). The underlying device is relevant
++            // for HIP context management.
++            auto underlyingDevice = pimGetUnderlyingDevice();
++            platformIds[numDevices].devices_.emplace_back(new _pi_device{
++                pimDevice, &platformIds[numDevices], underlyingDevice});
+             ++numDevices;
+ #endif // __HIP_ENABLE_PIM__
+             numPlatforms = numDevices;
+@@ -876,19 +963,47 @@ pi_result hip_piDevicesGet(pi_platform platform, pi_device_type device_type,
+   pi_result err = PI_SUCCESS;
+   const bool askingForDefault = device_type == PI_DEVICE_TYPE_DEFAULT;
+   const bool askingForGPU = device_type & PI_DEVICE_TYPE_GPU;
++#ifdef __HIP_ENABLE_PIM__
++  const bool askingForCustom = device_type & PI_DEVICE_TYPE_CUSTOM;
++  const bool returnDevices =
++      askingForDefault || askingForGPU || askingForCustom;
++  size_t numDevices = 0;
++  // Default devices for the HIP plugin are GPU devices. Override to enable
++  // comparison with get_device_type().
++  pi_device_type reqDevType =
++      (askingForDefault) ? PI_DEVICE_TYPE_GPU : device_type;
++  if (returnDevices) {
++    numDevices =
++        std::count_if(platform->devices_.begin(), platform->devices_.end(),
++                      [=](std::unique_ptr<_pi_device> &dev) {
++                        // Currently, the PIM devices are the only devices of
++                        // type custom, all other devices fulfill the query for
++                        // type GPU or default type.
++                        return (dev->get_device_type() & reqDevType);
++                      });
++  }
++#else  // __HIP_ENABLE_PIM__
+   const bool returnDevices = askingForDefault || askingForGPU;
+-
+   size_t numDevices = returnDevices ? platform->devices_.size() : 0;
+-
++#endif // __HIP_ENABLE_PIM__
+   try {
+     if (num_devices) {
+       *num_devices = numDevices;
+     }
+-
+     if (returnDevices && devices) {
++#ifdef __HIP_ENABLE_PIM__
++      for (size_t i = 0, devIdx = 0;
++           i < std::min(size_t(num_entries), numDevices); ++i) {
++        if (platform->devices_[i]->get_device_type() & reqDevType) {
++          devices[devIdx] = platform->devices_[i].get();
++          ++devIdx;
++        }
++      }
++#else  // __HIP_ENABLE_PIM__
+       for (size_t i = 0; i < std::min(size_t(num_entries), numDevices); ++i) {
+         devices[i] = platform->devices_[i].get();
+       }
++#endif // __HIP_ENABLE_PIM__
+     }
+ 
+     return err;
+@@ -1288,8 +1403,11 @@ pi_result getPIMDeviceInfo(pi_device device, pi_device_info param_name,
+     return getInfo(param_value_size, param_value, param_value_size_ret, "");
+   }
+   case PI_DEVICE_INFO_EXTENSIONS: {
+-    // No extensions, so should probably return an empty string here.
+-    return getInfo(param_value_size, param_value, param_value_size_ret, "");
++    // "samsung_pim" is not the name of any official OpenCL extension, it is
++    // just used here to mark the device as a PIM device and build a SYCL aspect
++    // on top of it.
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   "samsung_pim");
+   }
+   case PI_DEVICE_INFO_PRINTF_BUFFER_SIZE: {
+     // The minimum value for the FULL profile is 1 MB.
+@@ -2138,6 +2256,7 @@ pi_result hip_piContextCreate(const pi_context_properties *properties,
+   assert(retcontext != nullptr);
+   pi_result errcode_ret = PI_SUCCESS;
+ 
++#ifndef __HIP_STANDALONE_PIM__
+   // Parse properties.
+   bool property_hip_primary = false;
+   while (properties && (0 != *properties)) {
+@@ -2159,17 +2278,37 @@ pi_result hip_piContextCreate(const pi_context_properties *properties,
+       return PI_INVALID_VALUE;
+     }
+   }
++#endif // __HIP_STANDALONE_PIM__
+ 
+   std::unique_ptr<_pi_context> piContextPtr{nullptr};
+   try {
+     hipCtx_t current = nullptr;
+ 
++#ifdef __HIP_STANDALONE_PIM__
++    piContextPtr = std::unique_ptr<_pi_context>(
++        new _pi_context{_pi_context::kind::user_defined, current, *devices});
++
++#else // __HIP_STANDALONE_PIM__
++#ifdef __HIP_ENABLE_PIM__
++    // The device ID of the PIM device is not a valid device ID for the
++    // HIP/CUDA API. Currently, we assume that there is only a single GPU
++    // device installed and it contains the PIM blocks. We use this default
++    // device as the device to associcate the HIP context with.
++    auto underlyingDevice = (devices[0]->is_pim_device())
++                                ? devices[0]->get_underlying()
++                                : devices[0]->get();
++    // TODO(Lukas): Call setDevice on PIM SDK
++    // TODO(Lukas): Initialize PIM SDK here?
++#else  // __HIP_ENABLE_PIM__
++    auto underlyingDevice = devices[0]->get();
++#endif // __HIP_ENABLE_PIM__
++
+     if (property_hip_primary) {
+       // Use the HIP primary context and assume that we want to use it
+       // immediately as we want to forge context switches.
+       hipCtx_t Ctxt;
+       errcode_ret =
+-          PI_CHECK_ERROR(hipDevicePrimaryCtxRetain(&Ctxt, devices[0]->get()));
++          PI_CHECK_ERROR(hipDevicePrimaryCtxRetain(&Ctxt, underlyingDevice));
+       piContextPtr = std::unique_ptr<_pi_context>(
+           new _pi_context{_pi_context::kind::primary, Ctxt, *devices});
+       errcode_ret = PI_CHECK_ERROR(hipCtxPushCurrent(Ctxt));
+@@ -2178,7 +2317,7 @@ pi_result hip_piContextCreate(const pi_context_properties *properties,
+       hipCtx_t newContext;
+       PI_CHECK_ERROR(hipCtxGetCurrent(&current));
+       errcode_ret = PI_CHECK_ERROR(
+-          hipCtxCreate(&newContext, hipDeviceMapHost, devices[0]->get()));
++          hipCtxCreate(&newContext, hipDeviceMapHost, underlyingDevice));
+       piContextPtr = std::unique_ptr<_pi_context>(new _pi_context{
+           _pi_context::kind::user_defined, newContext, *devices});
+     }
+@@ -2195,7 +2334,7 @@ pi_result hip_piContextCreate(const pi_context_properties *properties,
+     if (current != nullptr) {
+       PI_CHECK_ERROR(hipCtxSetCurrent(current));
+     }
+-
++#endif // __HIP_STANDALONE_PIM__
+     *retcontext = piContextPtr.release();
+   } catch (pi_result err) {
+     errcode_ret = err;
+@@ -2216,6 +2355,10 @@ pi_result hip_piContextRelease(pi_context ctxt) {
+ 
+   std::unique_ptr<_pi_context> context{ctxt};
+ 
++#ifdef __HIP_STANDALONE_PIM__
++  return PI_SUCCESS;
++#endif // __HIP_STANDALONE_PIM__
++
+   PI_CHECK_ERROR(hipEventDestroy(context->evBase_));
+ 
+   if (!ctxt->is_primary()) {
+@@ -2237,7 +2380,9 @@ pi_result hip_piContextRelease(pi_context ctxt) {
+     return PI_CHECK_ERROR(hipCtxDestroy(hipCtxt));
+   } else {
+     // Primary context is not destroyed, but released
+-    hipDevice_t hipDev = ctxt->get_device()->get();
++    hipDevice_t hipDev = (ctxt->get_device()->is_pim_device())
++                             ? ctxt->get_device()->get_underlying()
++                             : ctxt->get_device()->get();
+     hipCtx_t current;
+     PI_CHECK_ERROR(hipCtxPopCurrent(&current));
+     return PI_CHECK_ERROR(hipDevicePrimaryCtxRelease(hipDev));
+@@ -2282,6 +2427,178 @@ pi_result hip_piextContextCreateWithNativeHandle(pi_native_handle nativeHandle,
+   return {};
+ }
+ 
++#ifdef __HIP_ENABLE_PIM__
++namespace {
++
++PimMemFlag translateMemFlag(pi_pim_mem_flag flag) {
++  switch (flag) {
++  case PI_PIM_ELT_OP:
++    return PimMemFlag::ELT_OP;
++  case PI_PIM_GEMV_INPUT:
++    return PimMemFlag::GEMV_INPUT;
++  case PI_PIM_GEMV_WEIGHT:
++    return PimMemFlag::GEMV_WEIGHT;
++  case PI_PIM_GEMV_OUTPUT:
++    return PimMemFlag::GEMV_OUTPUT;
++  case PI_PIM_GEMV_WEIGHT_T:
++    return PimMemFlag::GEMV_WEIGHT_T;
++  default:
++    assert(false && "Unknown PIM mem flag");
++  }
++}
++
++PimOpType translateOpType(pi_pim_op_type ty) {
++  switch (ty) {
++  case PI_PIM_OP_GEMV:
++    return PimOpType::OP_GEMV;
++  case PI_PIM_OP_ELT_ADD:
++    return PimOpType::OP_ELT_ADD;
++  case PI_PIM_OP_ELT_MUL:
++    return PimOpType::OP_ELT_MUL;
++  case PI_PIM_OP_RELU:
++    return PimOpType::OP_RELU;
++  case PI_PIM_OP_BN:
++    return PimOpType::OP_BN;
++  case PI_PIM_OP_COPY:
++    return PimOpType::OP_COPY;
++  default:
++    assert(false && "Unknown PIM operation type");
++  }
++}
++
++PimMemType getMemType(pi_pim_mem_flag flag) {
++  if (flag == PI_PIM_ELT_OP) {
++    return PimMemType::MEM_TYPE_PIM;
++  } else {
++    // Operands of GEMV need to be in device (GPU) memory, not in PIM memory.
++    return PimMemType::MEM_TYPE_DEVICE;
++  }
++}
++
++pi_result createPIMBuffer(pi_context context, pi_mem_flags flags, size_t size,
++                          void *host_ptr, pi_mem *ret_mem,
++                          const pi_mem_properties *properties) {
++  // PIM cannot use host memory for operation and the PIM SDK therefore does not
++  // expose functions for mapping/re-using host memory for PIM.
++  assert(!(flags & PI_MEM_FLAGS_HOST_PTR_ALLOC) &&
++         "Cannot map host pointers for use by PIM.");
++
++  // TODO(Lukas): Handle cases where data needs to be moved from GPU memory to
++  // PIM memory or vice versa.
++  int w = -1;
++  int h = -1;
++  int c = -1;
++  pi_mem_properties opTy = 0;
++  pi_mem_properties memFlag = 0;
++
++  // Decode the properties. This list of properties is currently used to pass
++  // information about layout and operation type from SYCL to the PIM SDK here.
++  if (properties) {
++    // The list of properties is zero-terminated.
++    while (*properties != 0) {
++      if (*properties == PI_MEM_PROPERTIES_PIM_DIMENSIONS) {
++        ++properties;
++        assert(*properties != 0 && "Not enough values provided");
++        w = static_cast<int>(*properties);
++        ++properties;
++        assert(*properties != 0 && "Not enough values provided");
++        h = static_cast<int>(*properties);
++        ++properties;
++        assert(*properties != 0 && "Not enough values provided");
++        c = static_cast<int>(*properties);
++        ++properties;
++      } else if (*properties == PI_MEM_PROPERTIES_PIM_MEM_FLAG) {
++        ++properties;
++        assert(*properties != 0 && "Not enough values provided");
++        memFlag = *properties;
++        ++properties;
++      } else if (*properties == PI_MEM_PROPERTIES_PIM_OP_TYPE) {
++        ++properties;
++        assert(*properties != 0 && "Not enough values provided");
++        opTy = *properties;
++        ++properties;
++      } else {
++        assert(false && "Unsupported memory property");
++      }
++    }
++  }
++
++  if (w < 0) {
++    // No size information provided by SYCL runtime, infer it from the number of
++    // bytes.
++    w = size / 2; // Floats are two bytes.
++    h = 1;
++    c = 1;
++  }
++
++  // We need to perform an initial copy in two scenarios:
++  // (1) The RT instructed us to do so (HOST_PTR_COPY)
++  // (2) The user/RT wants to use the existing host pointer. At the time of
++  // writing, PIM SDK does not expose functionality similar to hipHostRegister,
++  // so we need to perform an initial copy.
++  const bool performInitialCopy = (flags & PI_MEM_FLAGS_HOST_PTR_COPY) ||
++                                  (flags & PI_MEM_FLAGS_HOST_PTR_USE);
++  assert((!performInitialCopy || host_ptr) &&
++         "Need a valid host pointer for initial copy.");
++
++  PimMemType pimMemTy = (memFlag)
++                            ? getMemType(static_cast<pi_pim_mem_flag>(memFlag))
++                            : PimMemType::MEM_TYPE_PIM;
++  PimMemFlag pimMemFlag =
++      (memFlag) ? translateMemFlag(static_cast<pi_pim_mem_flag>(memFlag))
++                : PimMemFlag::ELT_OP; // Use element-wise operation as default.
++  PimOpType pimOpTy = (opTy)
++                          ? translateOpType(static_cast<pi_pim_op_type>(opTy))
++                          : PimOpType::OP_DUMMY; // Use dummy op as default.
++  // Current prototype is fixed to FP16 only.
++  PimPrecision pimPrec = PIM_FP16;
++  pi_result retErr = PI_SUCCESS;
++  pi_mem retMemObj = nullptr;
++  try {
++    ScopedContext active(context);
++    // Set n = 1 as long as there are no 4D buffers in SYCL.
++    auto *pimDesc = PimCreateDesc(1, c, h, w, pimPrec, pimOpTy);
++    if (!pimDesc) {
++      return PI_PIM_SDK_ERROR;
++    }
++    // If no user_ptr is given, this constructor will also allocate the
++    // necessary memory.
++    auto *pimBo = PimCreateBo(pimDesc, pimMemTy, pimMemFlag);
++    if (!pimBo) {
++      return PI_PIM_SDK_ERROR;
++    }
++
++    CHECK_PIM_ERROR(PimDestroyDesc(pimDesc));
++    auto allocMode = _pi_mem::mem_::pim_mem_::alloc_mode::classic;
++    if (flags & PI_MEM_FLAGS_HOST_PTR_USE) {
++      allocMode = _pi_mem::mem_::pim_mem_::alloc_mode::use_host_ptr;
++    } else if (flags & PI_MEM_FLAGS_HOST_PTR_COPY) {
++      allocMode = _pi_mem::mem_::pim_mem_::alloc_mode::copy_in;
++    }
++    auto piMemObj = std::unique_ptr<_pi_mem>(new _pi_mem{
++        context, pimBo, pimOpTy, pimMemFlag, allocMode, host_ptr, size});
++    if (piMemObj != nullptr) {
++      retMemObj = piMemObj.release();
++      if (performInitialCopy) {
++        // Runtime requested to copy the user pointer
++        PimMemCpyType cpyType =
++            (pimMemTy == MEM_TYPE_DEVICE) ? HOST_TO_DEVICE : HOST_TO_PIM;
++        CHECK_PIM_ERROR(
++            PimCopyMemory(pimBo->data, host_ptr, pimBo->size, cpyType));
++        CHECK_PIM_ERROR(PimSynchronize());
++      }
++    } else {
++      return PI_OUT_OF_HOST_MEMORY;
++    }
++  } catch (...) {
++    retErr = PI_OUT_OF_RESOURCES;
++  }
++  *ret_mem = retMemObj;
++  return retErr;
++}
++} // anonymous namespace
++#endif // __HIP_ENABLE_PIM__
++
+ /// Creates a PI Memory object using a HIP memory allocation.
+ /// Can trigger a manual copy depending on the mode.
+ /// \TODO Implement USE_HOST_PTR using cuHostRegister
+@@ -2291,6 +2608,12 @@ pi_result hip_piMemBufferCreate(pi_context context, pi_mem_flags flags,
+                                 const pi_mem_properties *properties) {
+   // Need input memory object
+   assert(ret_mem != nullptr);
++#ifdef __HIP_ENABLE_PIM__
++  if (context->get_device()->is_pim_device()) {
++    return createPIMBuffer(context, flags, size, host_ptr, ret_mem, properties);
++  }
++#endif // __HIP_ENABLE_PIM__
++
+   assert(properties == nullptr && "no mem properties goes to HIP RT yet");
+   // Currently, USE_HOST_PTR is not implemented using host register
+   // since this triggers a weird segfault after program ends.
+@@ -2401,6 +2724,14 @@ pi_result hip_piMemRelease(pi_mem memObj) {
+       };
+     }
+ 
++#ifdef __HIP_ENABLE_PIM__
++    else if (memObj->mem_type_ == _pi_mem::mem_type::pim) {
++      // Just free the memory, the PimBo is later on destroyed by the destructor
++      // of pi_mem_.
++      CHECK_PIM_ERROR(PimFreeMemory(memObj->mem_.pim_mem_.bo_));
++    }
++#endif // __HIP_ENABLE_PIM__
++
+     else if (memObj->mem_type_ == _pi_mem::mem_type::surface) {
+       ret = PI_CHECK_ERROR(hipDestroySurfaceObject(
+           uniqueMemObj->mem_.surface_mem_.get_surface()));
+@@ -2707,6 +3038,38 @@ pi_result hip_piextQueueCreateWithNativeHandle(pi_native_handle nativeHandle,
+   return {};
+ }
+ 
++#ifdef __HIP_ENABLE_PIM__
++
++namespace {
++
++enum class PimCopyDirection { Host2Acc, Acc2Host, Acc2Acc };
++
++bool isPIMMemory(const PimBo *memObj) {
++  return memObj->mem_type == PimMemType::MEM_TYPE_PIM;
++}
++
++PimMemCpyType getCopyType(PimCopyDirection direction, const PimBo *memObj,
++                          const PimBo *other = nullptr) {
++  auto isPimMem = isPIMMemory(memObj);
++  switch (direction) {
++  case PimCopyDirection::Host2Acc:
++    return (isPimMem) ? HOST_TO_PIM : HOST_TO_DEVICE;
++  case PimCopyDirection::Acc2Host:
++    return (isPimMem) ? PIM_TO_HOST : DEVICE_TO_HOST;
++  case PimCopyDirection::Acc2Acc:
++    auto otherPimMem = isPIMMemory(other);
++    if (isPimMem) {
++      return (otherPimMem) ? PIM_TO_PIM : PIM_TO_DEVICE;
++    } else {
++      return (otherPimMem) ? DEVICE_TO_PIM : DEVICE_TO_DEVICE;
++    }
++  }
++  __builtin_unreachable();
++}
++} // anonymous namespace
++
++#endif // __HIP_ENABLE_PIM__
++
+ pi_result hip_piEnqueueMemBufferWrite(pi_queue command_queue, pi_mem buffer,
+                                       pi_bool blocking_write, size_t offset,
+                                       size_t size, void *ptr,
+@@ -2732,16 +3095,36 @@ pi_result hip_piEnqueueMemBufferWrite(pi_queue command_queue, pi_mem buffer,
+       retImplEv->start();
+     }
+ 
+-    retErr = PI_CHECK_ERROR(
+-        hipMemcpyHtoDAsync(buffer->mem_.buffer_mem_.get_with_offset(offset),
+-                           ptr, size, hipStream));
++#ifdef __HIP_ENABLE_PIM__
++    if (command_queue->device_->is_pim_device()) {
++      // TODO(Lukas): PimCopyMemory doesn't accept a stream on its interface,
++      // make sure we correctly synchronize and the event is correct.
++      retErr = CHECK_PIM_ERROR(PimCopyMemory(
++          buffer->mem_.pim_mem_.get_with_offset(offset), ptr, size,
++          getCopyType(PimCopyDirection::Host2Acc, buffer->mem_.pim_mem_.bo_)));
++    } else {
++#endif // __HIP_ENABLE_PIM__
++      retErr = PI_CHECK_ERROR(
++          hipMemcpyHtoDAsync(buffer->mem_.buffer_mem_.get_with_offset(offset),
++                             ptr, size, hipStream));
++#ifdef __HIP_ENABLE_PIM__
++    }
++#endif // __HIP_ENABLE_PIM__
+ 
+     if (event) {
+       retErr = retImplEv->record();
+     }
+ 
+     if (blocking_write) {
+-      retErr = PI_CHECK_ERROR(hipStreamSynchronize(hipStream));
++#ifdef __HIP_ENABLE_PIM__
++      if (command_queue->device_->is_pim_device()) {
++        retErr = CHECK_PIM_ERROR(PimSynchronize(hipStream));
++      } else {
++#endif // __HIP_ENABLE_PIM__
++        retErr = PI_CHECK_ERROR(hipStreamSynchronize(hipStream));
++#ifdef __HIP_ENABLE_PIM__
++      }
++#endif // __HIP_ENABLE_PIM__
+     }
+ 
+     if (event) {
+@@ -2778,16 +3161,36 @@ pi_result hip_piEnqueueMemBufferRead(pi_queue command_queue, pi_mem buffer,
+       retImplEv->start();
+     }
+ 
+-    retErr = PI_CHECK_ERROR(hipMemcpyDtoHAsync(
+-        ptr, buffer->mem_.buffer_mem_.get_with_offset(offset), size,
+-        hipStream));
++#ifdef __HIP_ENABLE_PIM__
++    if (command_queue->device_->is_pim_device()) {
++      // TODO(Lukas): PimCopyMemory doesn't accept a stream on its interface,
++      // make sure we correctly synchronize and the event is correct.
++      retErr = CHECK_PIM_ERROR(PimCopyMemory(
++          ptr, buffer->mem_.pim_mem_.get_with_offset(offset), size,
++          getCopyType(PimCopyDirection::Acc2Host, buffer->mem_.pim_mem_.bo_)));
++    } else {
++#endif // __HIP_ENABLE_PIM__
++      retErr = PI_CHECK_ERROR(hipMemcpyDtoHAsync(
++          ptr, buffer->mem_.buffer_mem_.get_with_offset(offset), size,
++          hipStream));
++#ifdef __HIP_ENABLE_PIM__
++    }
++#endif // __HIP_ENABLE_PIM__
+ 
+     if (event) {
+       retErr = retImplEv->record();
+     }
+ 
+     if (blocking_read) {
+-      retErr = PI_CHECK_ERROR(hipStreamSynchronize(hipStream));
++#ifdef __HIP_ENABLE_PIM__
++      if (command_queue->device_->is_pim_device()) {
++        retErr = CHECK_PIM_ERROR(PimSynchronize(hipStream));
++      } else {
++#endif // __HIP_ENABLE_PIM__
++        retErr = PI_CHECK_ERROR(hipStreamSynchronize(hipStream));
++#ifdef __HIP_ENABLE_PIM__
++      }
++#endif // __HIP_ENABLE_PIM__
+     }
+ 
+     if (event) {
+@@ -4192,6 +4595,14 @@ pi_result hip_piEnqueueMemBufferReadRect(
+   assert(buffer != nullptr);
+   assert(command_queue != nullptr);
+ 
++#ifdef __HIP_ENABLE_PIM__
++  if (command_queue->device_->is_pim_device()) {
++    // This function is currently not supported on PIM devices, because the PIM
++    // SDK does not expose the corresponding API/functionality.
++    return PI_INVALID_OPERATION;
++  }
++#endif // __HIP_ENABLE_PIM__
++
+   pi_result retErr = PI_SUCCESS;
+   hipStream_t hipStream = command_queue->get();
+   void *devPtr = buffer->mem_.buffer_mem_.get_void();
+@@ -4243,6 +4654,14 @@ pi_result hip_piEnqueueMemBufferWriteRect(
+   assert(buffer != nullptr);
+   assert(command_queue != nullptr);
+ 
++#ifdef __HIP_ENABLE_PIM__
++  if (command_queue->device_->is_pim_device()) {
++    // This function is currently not supported on PIM devices, because the PIM
++    // SDK does not expose the corresponding API/functionality.
++    return PI_INVALID_OPERATION;
++  }
++#endif // __HIP_ENABLE_PIM__
++
+   pi_result retErr = PI_SUCCESS;
+   hipStream_t hipStream = command_queue->get();
+   void *devPtr = buffer->mem_.buffer_mem_.get_void();
+@@ -4312,10 +4731,26 @@ pi_result hip_piEnqueueMemBufferCopy(pi_queue command_queue, pi_mem src_buffer,
+     }
+ 
+     auto stream = command_queue->get();
+-    auto src = src_buffer->mem_.buffer_mem_.get_with_offset(src_offset);
+-    auto dst = dst_buffer->mem_.buffer_mem_.get_with_offset(dst_offset);
+ 
+-    result = PI_CHECK_ERROR(hipMemcpyDtoDAsync(dst, src, size, stream));
++#ifdef __HIP_ENABLE_PIM__
++    if (command_queue->device_->is_pim_device()) {
++      // TODO(Lukas): PimCopyMemory doesn't accept a stream on its interface,
++      // make sure we correctly synchronize and the event is correct.
++      auto src = src_buffer->mem_.pim_mem_.get_with_offset(src_offset);
++      auto dst = dst_buffer->mem_.pim_mem_.get_with_offset(dst_offset);
++      result = CHECK_PIM_ERROR(PimCopyMemory(
++          dst, src, size,
++          getCopyType(PimCopyDirection::Acc2Acc, src_buffer->mem_.pim_mem_.bo_,
++                      dst_buffer->mem_.pim_mem_.bo_)));
++    } else {
++#endif // __HIP_ENABLE_PIM__
++      auto src = src_buffer->mem_.buffer_mem_.get_with_offset(src_offset);
++      auto dst = dst_buffer->mem_.buffer_mem_.get_with_offset(dst_offset);
++
++      result = PI_CHECK_ERROR(hipMemcpyDtoDAsync(dst, src, size, stream));
++#ifdef __HIP_ENABLE_PIM__
++    }
++#endif // __HIP_ENABLE_PIM__
+ 
+     if (event) {
+       result = retImplEv->record();
+@@ -4342,6 +4777,14 @@ pi_result hip_piEnqueueMemBufferCopyRect(
+   assert(dst_buffer != nullptr);
+   assert(command_queue != nullptr);
+ 
++#ifdef __HIP_ENABLE_PIM__
++  if (command_queue->device_->is_pim_device()) {
++    // This function is currently not supported on PIM devices, because the PIM
++    // SDK does not expose the corresponding API/functionality.
++    return PI_INVALID_OPERATION;
++  }
++#endif // __HIP_ENABLE_PIM__
++
+   pi_result retErr = PI_SUCCESS;
+   hipStream_t hipStream = command_queue->get();
+   void *srcPtr = src_buffer->mem_.buffer_mem_.get_void();
+@@ -4384,6 +4827,14 @@ pi_result hip_piEnqueueMemBufferFill(pi_queue command_queue, pi_mem buffer,
+                                      pi_event *event) {
+   assert(command_queue != nullptr);
+ 
++#ifdef __HIP_ENABLE_PIM__
++  if (command_queue->device_->is_pim_device()) {
++    // This function is currently not supported on PIM devices, because the PIM
++    // SDK does not expose the corresponding API/functionality.
++    return PI_INVALID_OPERATION;
++  }
++#endif // __HIP_ENABLE_PIM__
++
+   auto args_are_multiples_of_pattern_size =
+       (offset % pattern_size == 0) || (size % pattern_size == 0);
+ 
+@@ -4827,20 +5278,48 @@ pi_result hip_piEnqueueMemBufferMap(pi_queue command_queue, pi_mem buffer,
+   assert(ret_map != nullptr);
+   assert(command_queue != nullptr);
+   assert(buffer != nullptr);
++#ifdef __HIP_ENABLE_PIM__
++  assert((buffer->mem_type_ == _pi_mem::mem_type::buffer) ||
++         (buffer->mem_type_ == _pi_mem::mem_type::pim));
++#else  // __HIP_ENABLE_PIM__
+   assert(buffer->mem_type_ == _pi_mem::mem_type::buffer);
++#endif // __HIP_ENABLE_PIM__
+ 
+   pi_result ret_err = PI_INVALID_OPERATION;
+-  const bool is_pinned = buffer->mem_.buffer_mem_.allocMode_ ==
+-                         _pi_mem::mem_::buffer_mem_::alloc_mode::alloc_host_ptr;
++  // PIM currently does not support pinned memory.
++  const bool is_pinned =
++      (buffer->mem_type_ == _pi_mem::mem_type::buffer) &&
++      (buffer->mem_.buffer_mem_.allocMode_ ==
++       _pi_mem::mem_::buffer_mem_::alloc_mode::alloc_host_ptr);
+ 
+   // Currently no support for overlapping regions
++#ifdef __HIP_ENABLE_PIM__
++  if ((buffer->is_buffer() &&
++       buffer->mem_.buffer_mem_.get_map_ptr() != nullptr) ||
++      (buffer->is_pim() && buffer->mem_.pim_mem_.get_map_ptr() != nullptr)) {
++    return ret_err;
++  }
++#else  // __HIP_ENABLE_PIM__
+   if (buffer->mem_.buffer_mem_.get_map_ptr() != nullptr) {
+     return ret_err;
+   }
++#endif // __HIP_ENABLE_PIM__
++
++  void *hostPtr = nullptr;
++#ifdef __HIP_ENABLE_PIM__
++  if (buffer->is_pim()) {
++    // Allocate a pointer in the host to store the mapped information
++    hostPtr = buffer->mem_.pim_mem_.map_to_ptr(offset, map_flags);
++    *ret_map = buffer->mem_.pim_mem_.get_map_ptr();
++  } else {
++#endif // __HIP_ENABLE_PIM__
++    // Allocate a pointer in the host to store the mapped information
++    hostPtr = buffer->mem_.buffer_mem_.map_to_ptr(offset, map_flags);
++    *ret_map = buffer->mem_.buffer_mem_.get_map_ptr();
++#ifdef __HIP_ENABLE_PIM__
++  }
++#endif // __HIP_ENABLE_PIM__
+ 
+-  // Allocate a pointer in the host to store the mapped information
+-  auto hostPtr = buffer->mem_.buffer_mem_.map_to_ptr(offset, map_flags);
+-  *ret_map = buffer->mem_.buffer_mem_.get_map_ptr();
+   if (hostPtr) {
+     ret_err = PI_SUCCESS;
+   }
+@@ -4887,17 +5366,38 @@ pi_result hip_piEnqueueMemUnmap(pi_queue command_queue, pi_mem memobj,
+   assert(command_queue != nullptr);
+   assert(mapped_ptr != nullptr);
+   assert(memobj != nullptr);
++#ifdef __HIP_ENABLE_PIM__
++  assert((memobj->mem_type_ == _pi_mem::mem_type::buffer) ||
++         (memobj->mem_type_ == _pi_mem::mem_type::pim));
++  bool writeBack = false;
++  if (memobj->is_pim()) {
++    assert(memobj->mem_.pim_mem_.get_map_ptr() != nullptr);
++    assert(memobj->mem_.pim_mem_.get_map_ptr() == mapped_ptr);
++    writeBack = ((memobj->mem_.pim_mem_.get_map_flags() & PI_MAP_WRITE) ||
++                 (memobj->mem_.pim_mem_.get_map_flags() &
++                  PI_MAP_WRITE_INVALIDATE_REGION));
++  } else {
++    assert(memobj->mem_.buffer_mem_.get_map_ptr() != nullptr);
++    assert(memobj->mem_.buffer_mem_.get_map_ptr() == mapped_ptr);
++    writeBack = ((memobj->mem_.buffer_mem_.get_map_flags() & PI_MAP_WRITE) ||
++                 (memobj->mem_.buffer_mem_.get_map_flags() &
++                  PI_MAP_WRITE_INVALIDATE_REGION));
++  }
++#else  // __HIP_ENABLE_PIM__
+   assert(memobj->mem_type_ == _pi_mem::mem_type::buffer);
+   assert(memobj->mem_.buffer_mem_.get_map_ptr() != nullptr);
+   assert(memobj->mem_.buffer_mem_.get_map_ptr() == mapped_ptr);
++  bool writeBack = ((memobj->mem_.buffer_mem_.get_map_flags() & PI_MAP_WRITE) ||
++                    (memobj->mem_.buffer_mem_.get_map_flags() &
++                     PI_MAP_WRITE_INVALIDATE_REGION));
++#endif // __HIP_ENABLE_PIM__
+ 
+-  const bool is_pinned = memobj->mem_.buffer_mem_.allocMode_ ==
+-                         _pi_mem::mem_::buffer_mem_::alloc_mode::alloc_host_ptr;
++  const bool is_pinned =
++      (memobj->mem_type_ == _pi_mem::mem_type::buffer) &&
++      (memobj->mem_.buffer_mem_.allocMode_ ==
++       _pi_mem::mem_::buffer_mem_::alloc_mode::alloc_host_ptr);
+ 
+-  if (!is_pinned &&
+-      ((memobj->mem_.buffer_mem_.get_map_flags() & PI_MAP_WRITE) ||
+-       (memobj->mem_.buffer_mem_.get_map_flags() &
+-        PI_MAP_WRITE_INVALIDATE_REGION))) {
++  if (!is_pinned && writeBack) {
+     // Pinned host memory is only on host so it doesn't need to be written to.
+     ret_err = hip_piEnqueueMemBufferWrite(
+         command_queue, memobj, true,
+@@ -5253,10 +5753,15 @@ pi_result hip_piextUSMGetMemAllocInfo(pi_context context, const void *ptr,
+ 
+ // This API is called by Sycl RT to notify the end of the plugin lifetime.
+ // TODO: add a global variable lifetime management code here (see
+-// pi_level_zero.cpp for reference) Currently this is just a NOOP.
++// pi_level_zero.cpp for reference). Currently, this is just de-initializing the
++// PIM SDK.
+ pi_result hip_piTearDown(void *PluginParameter) {
+   (void)PluginParameter;
++#ifdef __HIP_ENABLE_PIM__
++  return CHECK_PIM_ERROR(PimDeinitialize());
++#else  // __HIP_ENABLE_PIM__
+   return PI_SUCCESS;
++#endif // __HIP_ENABLE_PIM__
+ }
+ 
+ const char SupportedVersion[] = _PI_H_VERSION_STRING;
+diff --git a/sycl/plugins/hip/pi_hip.hpp b/sycl/plugins/hip/pi_hip.hpp
+index f0a315f6f393..439a7c170c94 100644
+--- a/sycl/plugins/hip/pi_hip.hpp
++++ b/sycl/plugins/hip/pi_hip.hpp
+@@ -32,6 +32,10 @@
+ #include <string>
+ #include <vector>
+ 
++#ifdef __HIP_ENABLE_PIM__
++#include "pim_runtime_api.h"
++#endif // __HIP_ENABLE_PIM__
++
+ extern "C" {
+ 
+ /// \cond INGORE_BLOCK_IN_DOXYGEN
+@@ -74,12 +78,19 @@ private:
+ 
+ #ifdef __HIP_ENABLE_PIM__
+   bool isPim_;
++
++  native_type underlyingDev_;
+ #endif // __HIP_ENABLE_PIM__
+ 
+ public:
+ #ifdef __HIP_ENABLE_PIM__
+-  _pi_device(native_type cuDevice, pi_platform platform, bool pim = false)
+-      : cuDevice_(cuDevice), refCount_{1}, platform_(platform), isPim_(pim) {}
++  _pi_device(native_type cuDevice, pi_platform platform, native_type underlying)
++      : cuDevice_(cuDevice), refCount_{1}, platform_(platform), isPim_(true),
++        underlyingDev_(underlying) {}
++
++  _pi_device(native_type cuDevice, pi_platform platform)
++      : cuDevice_(cuDevice), refCount_{1}, platform_(platform), isPim_(false),
++        underlyingDev_(cuDevice) {}
+ #else  // __HIP_ENABLE_PIM
+   _pi_device(native_type cuDevice, pi_platform platform)
+       : cuDevice_(cuDevice), refCount_{1}, platform_(platform) {}
+@@ -93,6 +104,12 @@ public:
+ 
+ #ifdef __HIP_ENABLE_PIM__
+   bool is_pim_device() const noexcept { return isPim_; }
++
++  pi_device_type get_device_type() const noexcept {
++    return (isPim_) ? PI_DEVICE_TYPE_CUSTOM : PI_DEVICE_TYPE_GPU;
++  }
++
++  native_type get_underlying() const noexcept { return underlyingDev_; }
+ #endif // __HIP_ENABLE_PIM__
+ };
+ 
+@@ -204,7 +221,11 @@ struct _pi_mem {
+ 
+   /// Reference counting of the handler
+   std::atomic_uint32_t refCount_;
++#ifdef __HIP_ENABLE_PIM__
++  enum class mem_type { buffer, pim, surface } mem_type_;
++#else  // __HIP_ENABLE_PIM__
+   enum class mem_type { buffer, surface } mem_type_;
++#endif // __HIP_ENABLE_PIM__
+ 
+   /// A PI Memory object represents either plain memory allocations ("Buffers"
+   /// in OpenCL) or typed allocations ("Images" in OpenCL).
+@@ -300,6 +321,108 @@ struct _pi_mem {
+       }
+     } buffer_mem_;
+ 
++#ifdef __HIP_ENABLE_PIM__
++
++    struct pim_mem_ {
++      using native_type = void *;
++
++      // TODO(Lukas): Do we want to support sub-buffers here?
++
++      /// Pointer to the underlying PIM buffer object.
++      PimBo *bo_;
++
++      /// Raw underlying pointer.
++      native_type ptr_;
++
++      /// Pointer associated with this device on the host
++      void *hostPtr_;
++
++      /// Size of the allocation in bytes.
++      size_t size_;
++
++      /// Offset of the active mapped region.
++      size_t mapOffset_;
++
++      /// Pointer to the active mapped region, if any.
++      void *mapPtr_;
++
++      /// Original flags for the mapped region.
++      pi_map_flags mapFlags_;
++
++      /** alloc_mode
++       * classic: Just a normal buffer allocated on the device via hip malloc
++       * use_host_ptr: Use an address on the host for the device
++       * copy_in: The data for the device comes from the host but the host
++       pointer is not available later for re-use
++       * alloc_host_ptr: Uses pinned-memory allocation
++      */
++      enum class alloc_mode {
++        classic,
++        use_host_ptr,
++        copy_in,
++        alloc_host_ptr
++      } allocMode_;
++
++      /// The type of PIM operation this buffer is used for
++      PimOpType opType_;
++
++      /// Type of memory used by the PIM SDK for this buffer
++      PimMemType memType_;
++
++      /// PIM-specific memory flag
++      PimMemFlag memFlag_;
++
++      native_type get_with_offset(size_t offset) const noexcept {
++        return reinterpret_cast<native_type>(reinterpret_cast<uint8_t *>(ptr_) +
++                                             offset);
++      }
++
++      size_t get_size() const noexcept { return size_; }
++
++      void *get_map_ptr() const noexcept { return mapPtr_; }
++
++      size_t get_map_offset(void *ptr) const noexcept {
++        (void)ptr;
++        return mapOffset_;
++      }
++
++      /// Returns a pointer to data visible on the host that contains
++      /// the data on the device associated with this allocation.
++      /// The offset is used to index into the HIP allocation.
++      ///
++      void *map_to_ptr(size_t offset, pi_map_flags flags) noexcept {
++        assert(mapPtr_ == nullptr);
++        mapOffset_ = offset;
++        mapFlags_ = flags;
++        if (hostPtr_) {
++          mapPtr_ = static_cast<char *>(hostPtr_) + offset;
++        } else {
++          // TODO: Allocate only what is needed based on the offset
++          mapPtr_ = static_cast<void *>(malloc(this->get_size()));
++        }
++        return mapPtr_;
++      }
++
++      /// Detach the allocation from the host memory.
++      void unmap(void *ptr) noexcept {
++        (void)ptr;
++        assert(mapPtr_ != nullptr);
++
++        if (mapPtr_ != hostPtr_) {
++          free(mapPtr_);
++        }
++        mapPtr_ = nullptr;
++        mapOffset_ = 0;
++      }
++
++      pi_map_flags get_map_flags() const noexcept {
++        assert(mapPtr_ != nullptr);
++        return mapFlags_;
++      }
++
++    } pim_mem_;
++#endif // __HIP_ENABLE_PIM__
++
+     // Handler data for surface object (i.e. Images)
+     struct surface_mem_ {
+       hipArray *array_;
+@@ -333,6 +456,27 @@ struct _pi_mem {
+     }
+   };
+ 
++#ifdef __HIP_ENABLE_PIM__
++
++  _pi_mem(pi_context ctxt, PimBo *bo, PimOpType opTy, PimMemFlag flag,
++          mem_::pim_mem_::alloc_mode mode, void *host_ptr, size_t size)
++      : context_{ctxt}, refCount_{1}, mem_type_{mem_type::pim} {
++    mem_.pim_mem_.bo_ = bo;
++    mem_.pim_mem_.ptr_ = bo->data;
++    mem_.pim_mem_.hostPtr_ = host_ptr;
++    mem_.pim_mem_.size_ = size;
++    mem_.pim_mem_.mapOffset_ = 0;
++    mem_.pim_mem_.mapPtr_ = nullptr;
++    mem_.pim_mem_.mapFlags_ = PI_MAP_WRITE;
++    mem_.pim_mem_.allocMode_ = mode;
++    mem_.pim_mem_.opType_ = opTy;
++    mem_.pim_mem_.memType_ = bo->mem_type;
++    mem_.pim_mem_.memFlag_ = flag;
++    hip_piContextRetain(context_);
++  }
++
++#endif // __HIP_ENABLE_PIM__
++
+   /// Constructs the PI allocation for an Image object
+   _pi_mem(pi_context ctxt, hipArray *array, hipSurfaceObject_t surf,
+           pi_mem_type image_type, void *host_ptr)
+@@ -351,6 +495,12 @@ struct _pi_mem {
+         return;
+       }
+     }
++#ifdef __HIP_ENABLE_PIM__
++    else if (mem_type_ == mem_type::pim) {
++      PimDestroyBo(mem_.pim_mem_.bo_);
++    }
++#endif // __HIP_ENABLE_PIM__
++
+     hip_piContextRelease(context_);
+   }
+ 
+@@ -363,6 +513,12 @@ struct _pi_mem {
+ 
+   bool is_image() const noexcept { return mem_type_ == mem_type::surface; }
+ 
++#ifdef __HIP_ENABLE_PIM__
++
++  bool is_pim() const noexcept { return mem_type_ == mem_type::pim; }
++
++#endif // __HIP_ENABLE_PIM__
++
+   pi_context get_context() const noexcept { return context_; }
+ 
+   pi_uint32 increment_reference_count() noexcept { return ++refCount_; }
+diff --git a/sycl/unittests/pi/CMakeLists.txt b/sycl/unittests/pi/CMakeLists.txt
+index 5c5cb40b5ab1..ee1e2ec6bbfd 100644
+--- a/sycl/unittests/pi/CMakeLists.txt
++++ b/sycl/unittests/pi/CMakeLists.txt
+@@ -28,3 +28,7 @@ endif()
+ if("cuda" IN_LIST SYCL_ENABLE_PLUGINS)
+     add_subdirectory(cuda)
+ endif()
++
++if("hip" IN_LIST SYCL_ENABLE_PLUGINS AND SYCL_HIP_PI_ENABLE_PIM)
++  add_subdirectory(pim)
++endif()
+diff --git a/sycl/unittests/pi/pim/CMakeLists.txt b/sycl/unittests/pi/pim/CMakeLists.txt
+new file mode 100644
+index 000000000000..f328a6aaccd2
+--- /dev/null
++++ b/sycl/unittests/pi/pim/CMakeLists.txt
+@@ -0,0 +1,25 @@
++add_sycl_unittest(PiPimTest OBJECT
++    test_pim_mem_obj.cpp)
++
++add_dependencies(PiPimTest sycl pi_hip)
++
++target_include_directories(PiPimTest
++  PRIVATE
++    "../"
++    "${sycl_inc_dir}/CL/sycl/detail/"
++    "${sycl_inc_dir}"
++    "${sycl_plugin_dir}/hip/"
++)
++
++
++if("${SYCL_BUILD_PI_HIP_PLATFORM}" STREQUAL "AMD")
++  # Set HIP define to select AMD platform
++  target_compile_definitions(PiPimTest PRIVATE __HIP_PLATFORM_AMD__)
++  target_link_libraries(PiPimTest PRIVATE rocmdrv)
++elseif("${SYCL_BUILD_PI_HIP_PLATFORM}" STREQUAL "NVIDIA")
++  # Set HIP define to select NVIDIA platform
++  target_compile_definitions(PiPimTest PRIVATE __HIP_PLATFORM_NVIDIA__)
++  target_link_libraries(PiPimTest PRIVATE cudart)
++else()
++  message(FATAL_ERROR "Unspecified PI HIP platform please set SYCL_BUILD_PI_HIP_PLATFORM to 'AMD' or 'NVIDIA'")
++endif()
+diff --git a/sycl/unittests/pi/pim/test_pim_mem_obj.cpp b/sycl/unittests/pi/pim/test_pim_mem_obj.cpp
+new file mode 100644
+index 000000000000..d90699f9ebf8
+--- /dev/null
++++ b/sycl/unittests/pi/pim/test_pim_mem_obj.cpp
+@@ -0,0 +1,448 @@
++//==---- test_pim_mem_obj.cpp --- PI unit tests ----------------------------==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "gtest/gtest.h"
++
++#include "TestGetPlugin.hpp"
++#include <CL/sycl.hpp>
++#include <CL/sycl/detail/pi.hpp>
++#include <detail/plugin.hpp>
++#include <pi_hip.hpp>
++
++using namespace cl::sycl;
++
++struct PimTestMemObj : public ::testing::Test {
++
++private:
++  constexpr static std::string_view PIM_EXTENSION_NAME = "samsung_pim";
++
++  std::string getStringDeviceInfo(pi_device dev, pi_device_info paramName) {
++    size_t resultSize = 0;
++    EXPECT_EQ((plugin->call_nocheck<detail::PiApiKind::piDeviceGetInfo>(
++                  dev, paramName, 0, nullptr, &resultSize)),
++              PI_SUCCESS)
++        << "piDeviceGetInfo failed.\n";
++    if (resultSize == 0) {
++      return std::string();
++    }
++    std::unique_ptr<char[]> result(new char[resultSize]);
++    EXPECT_EQ((plugin->call_nocheck<detail::PiApiKind::piDeviceGetInfo>(
++                  dev, paramName, resultSize, result.get(), nullptr)),
++              PI_SUCCESS)
++        << "piDeviceGetInfo failed.\n";
++    return std::string(result.get());
++  }
++
++  bool isPIMDevice(pi_device dev) {
++    auto allExtensions = getStringDeviceInfo(dev, PI_DEVICE_INFO_EXTENSIONS);
++    return (allExtensions.find(PIM_EXTENSION_NAME) != std::string::npos);
++  }
++
++  bool findPIMPlatform() {
++    pi_uint32 numPlatforms = 0;
++    EXPECT_EQ((plugin->call_nocheck<detail::PiApiKind::piPlatformsGet>(
++                  0, nullptr, &numPlatforms)),
++              PI_SUCCESS)
++        << "piPlatformsGet failed.\n";
++    std::unique_ptr<pi_platform[]> result(new pi_platform[numPlatforms]);
++    EXPECT_EQ((plugin->call_nocheck<detail::PiApiKind::piPlatformsGet>(
++                  numPlatforms, result.get(), nullptr)),
++              PI_SUCCESS)
++        << "piPlatformsGet failed.\n";
++    for (size_t i = 0; i < numPlatforms; ++i) {
++      for (auto &dev : result[i]->devices_) {
++        if (isPIMDevice(dev.get())) {
++          platform_ = result[i];
++          return true;
++        }
++      }
++    }
++    return false;
++  }
++
++protected:
++  std::optional<detail::plugin> plugin =
++      pi::initializeAndGet(backend::ext_oneapi_hip);
++
++  pi_platform platform_;
++
++  pi_device device_;
++
++  pi_context context_;
++
++  pi_queue queue_;
++
++  void SetUp() override {
++    if (!plugin.has_value()) {
++      GTEST_SKIP();
++    }
++    ASSERT_EQ(plugin->getBackend(), backend::ext_oneapi_hip);
++
++    ASSERT_TRUE(findPIMPlatform())
++        << "could not find a platform containing a PIM device";
++
++    pi_uint32 numDevices = 0;
++    // Assuming that PIM is the only device of type "custom" on the PIM
++    // platform.
++    ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piDevicesGet>(
++                  platform_, PI_DEVICE_TYPE_CUSTOM, 1, &device_, &numDevices)),
++              PI_SUCCESS);
++    ASSERT_EQ(numDevices, 1u) << "no device found.\n";
++    ASSERT_TRUE(isPIMDevice(device_)) << "device is not a PIM device.\n";
++
++    ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piContextCreate>(
++                  nullptr, 1, &device_, nullptr, nullptr, &context_)),
++              PI_SUCCESS);
++    EXPECT_NE(context_, nullptr);
++
++    ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piQueueCreate>(
++                  context_, device_, 0, &queue_)),
++              PI_SUCCESS);
++  }
++
++  void TearDown() override {
++    if (plugin.has_value()) {
++      plugin->call<detail::PiApiKind::piQueueRelease>(queue_);
++      plugin->call<detail::PiApiKind::piDeviceRelease>(device_);
++      plugin->call<detail::PiApiKind::piContextRelease>(context_);
++    }
++  }
++
++  PimTestMemObj() = default;
++
++  ~PimTestMemObj() = default;
++};
++
++namespace {
++
++auto getMemProperties() {
++  return std::array<pi_mem_properties, 9>{PI_MEM_PROPERTIES_PIM_DIMENSIONS,
++                                          16,
++                                          8,
++                                          4,
++                                          PI_MEM_PROPERTIES_PIM_MEM_FLAG,
++                                          pi_pim_mem_flag::PI_PIM_ELT_OP,
++                                          PI_MEM_PROPERTIES_PIM_OP_TYPE,
++                                          pi_pim_op_type::PI_PIM_OP_ELT_ADD,
++                                          0};
++}
++
++} // namespace
++
++TEST_F(PimTestMemObj, piMemBufferCreateSimple) {
++  constexpr size_t memSize = 1024u;
++  pi_mem memObj;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
++                context_, PI_MEM_FLAGS_ACCESS_RW, memSize, nullptr, &memObj,
++                getMemProperties().data())),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(memObj)),
++            PI_SUCCESS);
++}
++
++TEST_F(PimTestMemObj, piMemBufferCreateCopyPtr) {
++  constexpr size_t numElements = 512u;
++  constexpr size_t memSize = numElements * sizeof(sycl::half);
++  std::array<sycl::half, numElements> hostData;
++  std::array<sycl::half, numElements> output;
++  for (size_t i = 0; i < hostData.size(); ++i) {
++    hostData[i] = static_cast<sycl::half>(i);
++  }
++
++  pi_mem memObj;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
++                context_, PI_MEM_FLAGS_ACCESS_RW | PI_MEM_FLAGS_HOST_PTR_COPY,
++                memSize, hostData.data(), &memObj, getMemProperties().data())),
++            PI_SUCCESS);
++
++  // When the buffer is created with HOST_PTR_COPY, the runtime should perform
++  // an initial copy to the PIM memory and we should be able to read the host
++  // values from the device memory.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferRead>(
++                queue_, memObj, true, 0, memSize, output.data(), 0, nullptr,
++                nullptr)),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(memObj)),
++            PI_SUCCESS);
++
++  for (size_t i = 0; i < output.size(); ++i) {
++    ASSERT_EQ(output[i], static_cast<sycl::half>(i));
++  }
++}
++
++TEST_F(PimTestMemObj, piMemBufferCreateUseHostPtr) {
++  constexpr size_t numElements = 512u;
++  constexpr size_t memSize = numElements * sizeof(sycl::half);
++  std::array<sycl::half, numElements> hostData;
++  std::array<sycl::half, numElements> output;
++  for (size_t i = 0; i < hostData.size(); ++i) {
++    hostData[i] = static_cast<sycl::half>(i);
++  }
++
++  pi_mem memObj;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
++                context_, PI_MEM_FLAGS_ACCESS_RW | PI_MEM_FLAGS_HOST_PTR_USE,
++                memSize, hostData.data(), &memObj, getMemProperties().data())),
++            PI_SUCCESS);
++
++  // When the buffer is created with HOST_PTR_USE, the runtime needs to perform
++  // an initial copy to the PIM memory and we should be able to read the host
++  // values from the device memory.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferRead>(
++                queue_, memObj, true, 0, memSize, output.data(), 0, nullptr,
++                nullptr)),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(memObj)),
++            PI_SUCCESS);
++
++  for (size_t i = 0; i < output.size(); ++i) {
++    ASSERT_EQ(output[i], static_cast<sycl::half>(i));
++  }
++}
++
++TEST_F(PimTestMemObj, piMemBufferReadWrite) {
++  constexpr size_t numElements = 512u;
++  constexpr size_t memSize = numElements * sizeof(sycl::half);
++  std::array<sycl::half, numElements> hostData;
++  std::array<sycl::half, numElements> output;
++  for (size_t i = 0; i < hostData.size(); ++i) {
++    hostData[i] = static_cast<sycl::half>(i);
++  }
++
++  pi_mem memObj;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
++                context_, PI_MEM_FLAGS_ACCESS_RW, memSize, nullptr, &memObj,
++                getMemProperties().data())),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferWrite>(
++                queue_, memObj, true, 0, memSize, hostData.data(), 0, nullptr,
++                nullptr)),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferRead>(
++                queue_, memObj, true, 0, memSize, output.data(), 0, nullptr,
++                nullptr)),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(memObj)),
++            PI_SUCCESS);
++
++  for (size_t i = 0; i < output.size(); ++i) {
++    ASSERT_EQ(output[i], static_cast<sycl::half>(i));
++  }
++}
++
++TEST_F(PimTestMemObj, piMemBufferReadWriteWithOffset) {
++  constexpr size_t numElements = 256u;
++  constexpr size_t memSize = 512u * sizeof(sycl::half);
++  std::array<sycl::half, numElements> hostData;
++  std::array<sycl::half, numElements> output;
++  for (size_t i = 0; i < hostData.size(); ++i) {
++    hostData[i] = static_cast<sycl::half>(i);
++  }
++
++  pi_mem memObj;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
++                context_, PI_MEM_FLAGS_ACCESS_RW, memSize, nullptr, &memObj,
++                getMemProperties().data())),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferWrite>(
++                queue_, memObj, true, 32, numElements * sizeof(sycl::half),
++                hostData.data(), 0, nullptr, nullptr)),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferRead>(
++                queue_, memObj, true, 32, numElements * sizeof(sycl::half),
++                output.data(), 0, nullptr, nullptr)),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(memObj)),
++            PI_SUCCESS);
++
++  for (size_t i = 0; i < output.size(); ++i) {
++    ASSERT_EQ(output[i], static_cast<sycl::half>(i));
++  }
++}
++
++TEST_F(PimTestMemObj, piMemBufferCopy) {
++  constexpr size_t numElements = 512u;
++  constexpr size_t memSize = numElements * sizeof(sycl::half);
++  std::array<sycl::half, numElements> hostData;
++  std::array<sycl::half, numElements> output;
++  for (size_t i = 0; i < hostData.size(); ++i) {
++    hostData[i] = static_cast<sycl::half>(i);
++  }
++
++  pi_mem buf1;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
++                context_, PI_MEM_FLAGS_ACCESS_RW, memSize, nullptr, &buf1,
++                getMemProperties().data())),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferWrite>(
++                queue_, buf1, true, 0, memSize, hostData.data(), 0, nullptr,
++                nullptr)),
++            PI_SUCCESS);
++
++  pi_mem buf2;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
++                context_, PI_MEM_FLAGS_ACCESS_RW, memSize, nullptr, &buf2,
++                getMemProperties().data())),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferCopy>(
++                queue_, buf1, buf2, 0, 0, memSize, 0, nullptr, nullptr)),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(buf1)),
++            PI_SUCCESS);
++
++  ASSERT_EQ(
++      (plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferRead>(
++          queue_, buf2, true, 0, memSize, output.data(), 0, nullptr, nullptr)),
++      PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(buf2)),
++            PI_SUCCESS);
++
++  for (size_t i = 0; i < output.size(); ++i) {
++    ASSERT_EQ(output[i], static_cast<sycl::half>(i));
++  }
++}
++
++TEST_F(PimTestMemObj, piMemBufferCopyWithOffset) {
++  constexpr size_t numElements = 256u;
++  constexpr size_t memSize = 512u * sizeof(sycl::half);
++  constexpr size_t dataSize = numElements * sizeof(sycl::half);
++  std::array<sycl::half, numElements> hostData;
++  std::array<sycl::half, numElements> output;
++  for (size_t i = 0; i < hostData.size(); ++i) {
++    hostData[i] = static_cast<sycl::half>(i);
++  }
++
++  pi_mem buf1;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
++                context_, PI_MEM_FLAGS_ACCESS_RW, memSize, nullptr, &buf1,
++                getMemProperties().data())),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferWrite>(
++                queue_, buf1, true, 32, dataSize, hostData.data(), 0, nullptr,
++                nullptr)),
++            PI_SUCCESS);
++
++  pi_mem buf2;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
++                context_, PI_MEM_FLAGS_ACCESS_RW, memSize, nullptr, &buf2,
++                getMemProperties().data())),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferCopy>(
++                queue_, buf1, buf2, 32, 48, dataSize, 0, nullptr, nullptr)),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(buf1)),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferRead>(
++                queue_, buf2, true, 48, dataSize, output.data(), 0, nullptr,
++                nullptr)),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(buf2)),
++            PI_SUCCESS);
++
++  for (size_t i = 0; i < output.size(); ++i) {
++    ASSERT_EQ(output[i], static_cast<sycl::half>(i));
++  }
++}
++
++TEST_F(PimTestMemObj, piMemBufferMapForRead) {
++  constexpr size_t numElements = 512u;
++  constexpr size_t memSize = numElements * sizeof(sycl::half);
++  std::array<sycl::half, numElements> hostData;
++  for (size_t i = 0; i < hostData.size(); ++i) {
++    hostData[i] = static_cast<sycl::half>(i);
++  }
++
++  pi_mem memObj;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
++                context_, PI_MEM_FLAGS_ACCESS_RW, memSize, nullptr, &memObj,
++                getMemProperties().data())),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferWrite>(
++                queue_, memObj, true, 0, memSize, hostData.data(), 0, nullptr,
++                nullptr)),
++            PI_SUCCESS);
++
++  void *output = nullptr;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferMap>(
++                queue_, memObj, true, PI_MAP_READ, 0, memSize, 0, nullptr,
++                nullptr, &output)),
++            PI_SUCCESS);
++
++  ASSERT_NE(output, nullptr);
++
++  for (size_t i = 0; i < numElements; ++i) {
++    ASSERT_EQ(static_cast<sycl::half *>(output)[i], static_cast<sycl::half>(i));
++  }
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemUnmap>(
++                queue_, memObj, output, 0, nullptr, nullptr)),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(memObj)),
++            PI_SUCCESS);
++}
++
++TEST_F(PimTestMemObj, piMemBufferMapForWrite) {
++  constexpr size_t numElements = 512u;
++  constexpr size_t memSize = numElements * sizeof(sycl::half);
++
++  pi_mem memObj;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
++                context_, PI_MEM_FLAGS_ACCESS_RW, memSize, nullptr, &memObj,
++                getMemProperties().data())),
++            PI_SUCCESS);
++
++  void *hostData = nullptr;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferMap>(
++                queue_, memObj, true, PI_MAP_WRITE, 0, memSize, 0, nullptr,
++                nullptr, &hostData)),
++            PI_SUCCESS);
++
++  ASSERT_NE(hostData, nullptr);
++
++  for (size_t i = 0; i < numElements; ++i) {
++    static_cast<sycl::half *>(hostData)[i] = static_cast<sycl::half>(i);
++  }
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemUnmap>(
++                queue_, memObj, hostData, 0, nullptr, nullptr)),
++            PI_SUCCESS);
++
++  std::array<sycl::half, numElements> output;
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferRead>(
++                queue_, memObj, true, 0, memSize, output.data(), 0, nullptr,
++                nullptr)),
++            PI_SUCCESS);
++
++  for (size_t i = 0; i < numElements; ++i) {
++    ASSERT_EQ(output[i], static_cast<sycl::half>(i));
++  }
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(memObj)),
++            PI_SUCCESS);
++}
+-- 
+2.17.1
+

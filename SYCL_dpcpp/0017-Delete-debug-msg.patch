@@ -1,0 +1,34 @@
+From e6d3a443e456465c15b1826949ab442a181ff06d Mon Sep 17 00:00:00 2001
+From: "hyesun.hong" <hyesun.hong@samsung.com>
+Date: Thu, 1 Dec 2022 12:05:09 +0900
+Subject: [PATCH 17/17] Delete debug msg
+
+---
+ sycl/source/detail/scheduler/commands.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/sycl/source/detail/scheduler/commands.cpp b/sycl/source/detail/scheduler/commands.cpp
+index 2e4fcccb966c..412ef45df6e1 100644
+--- a/sycl/source/detail/scheduler/commands.cpp
++++ b/sycl/source/detail/scheduler/commands.cpp
+@@ -2676,7 +2676,7 @@ pi_result ExecCGCommand::LaunchPimOperation(
+     if (CachedKernel != Cache.end()) {
+       OpKernel = CachedKernel->second.Ptr.load();
+       KernelCacheHit = true;
+-      std::cout << "Cache hit with " << KernelIdentifier << "\n";
++      // std::cout << "Cache hit with " << KernelIdentifier << "\n";
+     } else {
+       Plugin.call<detail::PiApiKind::piKernelCreate>(
+           DummyProgram, PimOpType.c_str(), &OpKernel);
+@@ -2685,7 +2685,7 @@ pi_result ExecCGCommand::LaunchPimOperation(
+                     std::forward_as_tuple(KernelIdentifier),
+                     std::forward_as_tuple(OpKernel, 1));
+       KernelCacheHit = false;
+-      std::cout << "Cache miss with " << KernelIdentifier << "\n";
++      // std::cout << "Cache miss with " << KernelIdentifier << "\n";
+     }
+   }
+   assert(OpKernel != nullptr);
+-- 
+2.17.1
+

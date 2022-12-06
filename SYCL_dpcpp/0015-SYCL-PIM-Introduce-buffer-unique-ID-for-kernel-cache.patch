@@ -1,0 +1,210 @@
+From 6d762eed4eaeb38e2a2eb48ded0ebeafb48c18f8 Mon Sep 17 00:00:00 2001
+From: Lukas Sommer <lukas.sommer@codeplay.com>
+Date: Tue, 27 Sep 2022 09:46:52 +0100
+Subject: [PATCH 15/17] [SYCL][PIM] Introduce buffer unique ID for kernel cache
+ key
+
+---
+ .../include/CL/sycl/detail/sycl_mem_obj_t.hpp | 10 +++++++-
+ sycl/source/detail/scheduler/commands.cpp     | 11 +++-----
+ sycl/source/detail/scheduler/commands.hpp     |  3 +--
+ sycl/source/detail/sycl_mem_obj_t.cpp         |  6 ++++-
+ sycl/test/abi/layout_buffer.cpp               |  5 ++--
+ sycl/test/abi/layout_image.cpp                | 25 ++++++++++---------
+ sycl/test/abi/symbol_size_alignment.cpp       |  8 +++---
+ 7 files changed, 39 insertions(+), 29 deletions(-)
+
+diff --git a/sycl/include/CL/sycl/detail/sycl_mem_obj_t.hpp b/sycl/include/CL/sycl/detail/sycl_mem_obj_t.hpp
+index db4aeb61fda9..6137f2a4300a 100644
+--- a/sycl/include/CL/sycl/detail/sycl_mem_obj_t.hpp
++++ b/sycl/include/CL/sycl/detail/sycl_mem_obj_t.hpp
+@@ -19,6 +19,7 @@
+ #include <CL/sycl/property_list.hpp>
+ #include <CL/sycl/stl.hpp>
+ 
++#include <atomic>
+ #include <cstring>
+ #include <memory>
+ #include <type_traits>
+@@ -68,7 +69,8 @@ public:
+         MInteropContext(nullptr), MInteropMemObject(nullptr),
+         MOpenCLInterop(false), MHostPtrReadOnly(false), MNeedWriteBack(true),
+         MSizeInBytes(SizeInBytes), MUserPtr(nullptr), MShadowCopy(nullptr),
+-        MUploadDataFunctor(nullptr), MSharedPtrStorage(nullptr) {}
++        MUploadDataFunctor(nullptr), MSharedPtrStorage(nullptr),
++        MUniqueID(IDCount++) {}
+ 
+   SYCLMemObjT(const property_list &Props,
+               std::unique_ptr<SYCLMemObjAllocator> Allocator)
+@@ -325,6 +327,8 @@ public:
+ 
+   bool isInterop() const;
+ 
++  size_t getID() const { return MUniqueID; }
++
+ protected:
+   // An allocateMem helper that determines which host ptr to use
+   void determineHostPtr(const ContextImplPtr &Context, bool InitFromUserData,
+@@ -360,6 +364,10 @@ protected:
+   // Field which holds user's shared_ptr in case of memory object is created
+   // using constructor with shared_ptr.
+   std::shared_ptr<const void> MSharedPtrStorage;
++  // Unique ID to distinguish different buffers in the program.
++  size_t MUniqueID;
++  // Static counter for the unique IDs.
++  static std::atomic<uint64_t> IDCount;
+ };
+ 
+ } // namespace detail
+diff --git a/sycl/source/detail/scheduler/commands.cpp b/sycl/source/detail/scheduler/commands.cpp
+index cd9989ef8047..4ab862080ab0 100644
+--- a/sycl/source/detail/scheduler/commands.cpp
++++ b/sycl/source/detail/scheduler/commands.cpp
+@@ -2660,7 +2660,7 @@ pi_result ExecCGCommand::LaunchPimOperation(
+     return PI_INVALID_OPERATION;
+   }
+   auto KernelIdentifier =
+-      getPIMKernelIdentifier(PimOpType, Args, getMemAllocationFunc);
++      getPIMKernelIdentifier(PimOpType, Args);
+ 
+   // First, check the cache if this combination of PIM operation and arguments
+   // has been encountered before. If this is the case, the kernel can be
+@@ -2753,12 +2753,10 @@ std::string ExecCGCommand::translatePimOpType(CGPim::PIM_OPERATION Op) {
+ }
+ 
+ std::string ExecCGCommand::getPIMKernelIdentifier(
+-    const std::string &OpType, const std::vector<ArgDesc> &Args,
+-    const std::function<void *(Requirement *Req)> &getMemAllocationFunc) {
++    const std::string &OpType, const std::vector<ArgDesc> &Args) {
+   std::stringstream Identifier;
+   Identifier << OpType;
+-  auto ToIdentifier = [&Identifier,
+-                       &getMemAllocationFunc](const detail::ArgDesc &Arg) {
++  auto ToIdentifier = [&Identifier](const detail::ArgDesc &Arg) {
+     switch (Arg.MType) {
+     case kernel_param_kind_t::kind_accessor: {
+       auto *Req = static_cast<Requirement *>(Arg.MPtr);
+@@ -2767,8 +2765,7 @@ std::string ExecCGCommand::getPIMKernelIdentifier(
+                                                 "followed the path for "
+                                                 "which accessors are "
+                                                 "used");
+-      RT::PiMem MemArg = static_cast<RT::PiMem>(getMemAllocationFunc(Req));
+-      Identifier << "_" << MemArg;
++      Identifier << "_" << static_cast<SYCLMemObjT*>(Req->MSYCLMemObj)->getID();
+       break;
+     }
+     case kernel_param_kind_t::kind_std_layout: {
+diff --git a/sycl/source/detail/scheduler/commands.hpp b/sycl/source/detail/scheduler/commands.hpp
+index 235dc9b0d8f3..3ec4dc318365 100644
+--- a/sycl/source/detail/scheduler/commands.hpp
++++ b/sycl/source/detail/scheduler/commands.hpp
+@@ -579,8 +579,7 @@ private:
+   std::string translatePimOpType(CGPim::PIM_OPERATION Op);
+ 
+   std::string getPIMKernelIdentifier(
+-      const std::string &OpType, const std::vector<ArgDesc> &Args,
+-      const std::function<void *(Requirement *Req)> &getMemAllocationFunc);
++      const std::string &OpType, const std::vector<ArgDesc> &Args);
+ 
+   std::unique_ptr<detail::CG> MCommandGroup;
+ 
+diff --git a/sycl/source/detail/sycl_mem_obj_t.cpp b/sycl/source/detail/sycl_mem_obj_t.cpp
+index 29de21ce6653..c47882ff5287 100644
+--- a/sycl/source/detail/sycl_mem_obj_t.cpp
++++ b/sycl/source/detail/sycl_mem_obj_t.cpp
+@@ -36,7 +36,7 @@ SYCLMemObjT::SYCLMemObjT(pi_native_handle MemObject, const context &SyclContext,
+       MInteropContext(detail::getSyclObjImpl(SyclContext)),
+       MOpenCLInterop(true), MHostPtrReadOnly(false), MNeedWriteBack(true),
+       MUserPtr(nullptr), MShadowCopy(nullptr), MUploadDataFunctor(nullptr),
+-      MSharedPtrStorage(nullptr) {
++      MSharedPtrStorage(nullptr), MUniqueID(IDCount++) {
+   if (MInteropContext->is_host())
+     throw cl::sycl::invalid_parameter_error(
+         "Creation of interoperability memory object using host context is "
+@@ -156,6 +156,10 @@ void SYCLMemObjT::determineHostPtr(const ContextImplPtr &Context,
+   } else
+     HostPtrReadOnly = false;
+ }
++
++// Initialize counter for unique IDs.
++std::atomic<uint64_t> SYCLMemObjT::IDCount{0};
++
+ } // namespace detail
+ } // namespace sycl
+ } // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/test/abi/layout_buffer.cpp b/sycl/test/abi/layout_buffer.cpp
+index 39192ece2bcc..c9f794ef39a3 100644
+--- a/sycl/test/abi/layout_buffer.cpp
++++ b/sycl/test/abi/layout_buffer.cpp
+@@ -76,8 +76,9 @@ void foo(sycl::buffer<int, 2>) {}
+ // CHECK-NEXT:  168 |         std::__shared_ptr<const void, __gnu_cxx::_S_atomic>::element_type * _M_ptr
+ // CHECK-NEXT:  176 |         class std::__shared_count<__gnu_cxx::_S_atomic> _M_refcount
+ // CHECK-NEXT:  176 |           _Sp_counted_base<(enum __gnu_cxx::_Lock_policy)2U> * _M_pi
+-// CHECK-NEXT:      | [sizeof=184, dsize=184, align=8,
+-// CHECK-NEXT:      |  nvsize=184, nvalign=8]
++// CHECK-NEXT:  184 |   size_t MUniqueID
++// CHECK-NEXT:      | [sizeof=192, dsize=192, align=8,
++// CHECK-NEXT:      |  nvsize=192, nvalign=8]
+ 
+ // CHECK: 0 | class sycl::buffer<int, 2, class sycl::detail::aligned_allocator<char>, void>
+ // CHECK-NEXT: 0 |   class std::shared_ptr<class sycl::detail::buffer_impl> impl
+diff --git a/sycl/test/abi/layout_image.cpp b/sycl/test/abi/layout_image.cpp
+index ef717f617b4d..f99a4d7c3473 100644
+--- a/sycl/test/abi/layout_image.cpp
++++ b/sycl/test/abi/layout_image.cpp
+@@ -77,18 +77,19 @@ sycl::image<2> Img{sycl::image_channel_order::rgba, sycl::image_channel_type::fp
+ // CHECK-NEXT: 168 |         std::__shared_ptr<const void, __gnu_cxx::_S_atomic>::element_type * _M_ptr
+ // CHECK-NEXT: 176 |         class std::__shared_count<__gnu_cxx::_S_atomic> _M_refcount
+ // CHECK-NEXT: 176 |           _Sp_counted_base<(enum __gnu_cxx::_Lock_policy)2U> * _M_pi
+-// CHECK-NEXT: 184 |   _Bool MIsArrayImage
+-// CHECK-NEXT: 192 |   class sycl::range<2> MRange
+-// CHECK-NEXT: 192 |     class sycl::detail::array<2> (base)
+-// CHECK-NEXT: 192 |       size_t[2] common_array
+-// CHECK-NEXT: 208 |   enum sycl::image_channel_order MOrder
+-// CHECK-NEXT: 212 |   enum sycl::image_channel_type MType
+-// CHECK-NEXT: 216 |   uint8_t MNumChannels
+-// CHECK-NEXT: 224 |   size_t MElementSize
+-// CHECK-NEXT: 232 |   size_t MRowPitch
+-// CHECK-NEXT: 240 |   size_t MSlicePitch
+-// CHECK-NEXT:     | [sizeof=248, dsize=248, align=8,
+-// CHECK-NEXT:     |  nvsize=248, nvalign=8]
++// CHECK-NEXT: 184 |     size_t MUniqueID
++// CHECK-NEXT: 192 |   _Bool MIsArrayImage
++// CHECK-NEXT: 200 |   class sycl::range<2> MRange
++// CHECK-NEXT: 200 |     class sycl::detail::array<2> (base)
++// CHECK-NEXT: 200 |       size_t[2] common_array
++// CHECK-NEXT: 216 |   enum sycl::image_channel_order MOrder
++// CHECK-NEXT: 220 |   enum sycl::image_channel_type MType
++// CHECK-NEXT: 224 |   uint8_t MNumChannels
++// CHECK-NEXT: 232 |   size_t MElementSize
++// CHECK-NEXT: 240 |   size_t MRowPitch
++// CHECK-NEXT: 248 |   size_t MSlicePitch
++// CHECK-NEXT:     | [sizeof=256, dsize=256, align=8,
++// CHECK-NEXT:     |  nvsize=256, nvalign=8]
+ 
+ // CHECK: 0 | class sycl::image<2>
+ // CHECK-NEXT: 0 |   class std::shared_ptr<class sycl::detail::image_impl<2> > impl
+diff --git a/sycl/test/abi/symbol_size_alignment.cpp b/sycl/test/abi/symbol_size_alignment.cpp
+index 68cd05e15874..680d14b224f2 100644
+--- a/sycl/test/abi/symbol_size_alignment.cpp
++++ b/sycl/test/abi/symbol_size_alignment.cpp
+@@ -59,12 +59,12 @@ int main() {
+   check<gpu_selector, 8, 8>();
+ #ifdef _MSC_VER
+   check<handler, 552, 8>();
+-  check<detail::buffer_impl, 216, 8>();
+-  check<detail::image_impl<1>, 272, 8>();
++  check<detail::buffer_impl, 224, 8>();
++  check<detail::image_impl<1>, 280, 8>();
+ #else
+   check<handler, 560, 8>();
+-  check<detail::buffer_impl, 184, 8>();
+-  check<detail::image_impl<1>, 240, 8>();
++  check<detail::buffer_impl, 192, 8>();
++  check<detail::image_impl<1>, 248, 8>();
+ #endif
+   check<image<1>, 16, 8>();
+   check<kernel, 16, 8>();
+-- 
+2.17.1
+

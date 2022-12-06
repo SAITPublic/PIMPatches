@@ -1,0 +1,688 @@
+From a2f99ee231beb7645ac072aa3049d3c40a1e1cdf Mon Sep 17 00:00:00 2001
+From: Lukas Sommer <lukas.sommer@codeplay.com>
+Date: Tue, 24 May 2022 14:36:53 +0000
+Subject: [PATCH 01/17] [SYCL][HIP][PIM] Add PIM device to HIP plugin;
+
+Adds a PIM device of device type `custom` to the HIP PI plugin and lists it as part of the topology in `sycl-ls`;
+At the time of writing, the Samsung PIM SDK does not have an API for device detection or information. The PIM device is therefore always present if enabled via CMake during build;
+---
+ sycl/include/CL/sycl/detail/pi.h        |   6 +-
+ sycl/include/CL/sycl/info/info_desc.hpp |   2 +-
+ sycl/plugins/hip/CMakeLists.txt         |  20 ++
+ sycl/plugins/hip/pi_hip.cpp             | 427 +++++++++++++++++++++++-
+ sycl/plugins/hip/pi_hip.hpp             |  13 +
+ sycl/tools/sycl-ls/sycl-ls.cpp          |   3 +
+ sycl/unittests/pi/CMakeLists.txt        |  13 +
+ sycl/unittests/pi/EnqueueMemTest.cpp    |  21 ++
+ 8 files changed, 494 insertions(+), 11 deletions(-)
+
+diff --git a/sycl/include/CL/sycl/detail/pi.h b/sycl/include/CL/sycl/detail/pi.h
+index ad2217368ddb..fb6fc91d75ae 100644
+--- a/sycl/include/CL/sycl/detail/pi.h
++++ b/sycl/include/CL/sycl/detail/pi.h
+@@ -176,8 +176,10 @@ typedef enum : pi_uint64 {
+   PI_DEVICE_TYPE_CPU =
+       CL_DEVICE_TYPE_CPU, ///< A PI device that is the host processor.
+   PI_DEVICE_TYPE_GPU = CL_DEVICE_TYPE_GPU, ///< A PI device that is a GPU.
+-  PI_DEVICE_TYPE_ACC = CL_DEVICE_TYPE_ACCELERATOR ///< A PI device that is a
+-                                                  ///< dedicated accelerator.
++  PI_DEVICE_TYPE_ACC = CL_DEVICE_TYPE_ACCELERATOR, ///< A PI device that is a
++                                                   ///< dedicated accelerator.
++  PI_DEVICE_TYPE_CUSTOM =
++      CL_DEVICE_TYPE_CUSTOM ///< A PI device that is a custom device.
+ } _pi_device_type;
+ 
+ typedef enum {
+diff --git a/sycl/include/CL/sycl/info/info_desc.hpp b/sycl/include/CL/sycl/info/info_desc.hpp
+index f56f06247f51..878c2c15edf4 100644
+--- a/sycl/include/CL/sycl/info/info_desc.hpp
++++ b/sycl/include/CL/sycl/info/info_desc.hpp
+@@ -181,8 +181,8 @@ enum class device_type : pi_uint64 {
+   cpu         = PI_DEVICE_TYPE_CPU,
+   gpu         = PI_DEVICE_TYPE_GPU,
+   accelerator = PI_DEVICE_TYPE_ACC,
++  custom      = PI_DEVICE_TYPE_CUSTOM,
+   // TODO: figure out if we need all the below in PI
+-  custom      = CL_DEVICE_TYPE_CUSTOM,
+   automatic,
+   host,
+   all         = CL_DEVICE_TYPE_ALL
+diff --git a/sycl/plugins/hip/CMakeLists.txt b/sycl/plugins/hip/CMakeLists.txt
+index a03d1c868309..5106a6901073 100644
+--- a/sycl/plugins/hip/CMakeLists.txt
++++ b/sycl/plugins/hip/CMakeLists.txt
+@@ -4,6 +4,13 @@ set(SYCL_BUILD_PI_HIP_PLATFORM "AMD" CACHE STRING "PI HIP platform, AMD or NVIDI
+ 
+ message(STATUS "Including the PI API HIP backend for ${SYCL_BUILD_PI_HIP_PLATFORM}.")
+ 
++# Enable support for Samsung PIM in the HIP PI plugin.
++option(SYCL_HIP_PI_ENABLE_PIM "Enable PIM support in the HIP PI plugin" ON)
++
++# The following option can be used for development of the PIM feature on 
++# non-AMD machines.
++option(SYCL_HIP_PI_STANDALONE_PIM "Enable PIM on non-AMD machines" OFF)
++
+ # Set default HIP include dirs
+ set(SYCL_BUILD_PI_HIP_INCLUDE_DIR "/opt/rocm/hip/include" CACHE STRING "HIP include dir")
+ set(SYCL_BUILD_PI_HIP_HSA_INCLUDE_DIR "/opt/rocm/hsa/include" CACHE STRING "HSA include dir")
+@@ -70,3 +77,16 @@ else()
+   message(FATAL_ERROR "Unspecified PI HIP platform please set SYCL_BUILD_PI_HIP_PLATFORM to 'AMD' or 'NVIDIA'")
+ endif()
+ 
++# This option is currently evaluated on Nvidia and AMD platforms to allow
++# development on Nvidia GPUs.
++# TODO(Lukas) Evaluate on AMD only, because there's no Nvidia device 
++# with Samsung PIM.
++if(SYCL_HIP_PI_ENABLE_PIM)
++  target_compile_definitions(pi_hip PRIVATE __HIP_ENABLE_PIM__)
++
++  # Additional compile definitions for development purposes.
++  if(SYCL_HIP_PI_STANDALONE_PIM)
++    # Development version on non-AMD machines
++    target_compile_definitions(pi_hip PRIVATE __HIP_STANDALONE_PIM__)
++  endif()
++endif()
+diff --git a/sycl/plugins/hip/pi_hip.cpp b/sycl/plugins/hip/pi_hip.cpp
+index a715c7e06438..dd31a322f282 100644
+--- a/sycl/plugins/hip/pi_hip.cpp
++++ b/sycl/plugins/hip/pi_hip.cpp
+@@ -703,26 +703,49 @@ pi_result hip_piPlatformsGet(pi_uint32 num_entries, pi_platform *platforms,
+             return;
+           }
+           int numDevices = 0;
++#ifndef __HIP_STANDALONE_PIM__
+           hipError_t hipErrorCode = hipGetDeviceCount(&numDevices);
+           if (hipErrorCode == hipErrorNoDevice) {
++            // This check has been deactivated to allow development
++            // of PIM extension on non-AMD machines.
+             numPlatforms = 0;
+             return;
+           }
+           err = PI_CHECK_ERROR(hipErrorCode);
+           if (numDevices == 0) {
++            // This check has been deactivated to allow development
++            // of PIM extension on non-AMD machines.
+             numPlatforms = 0;
+             return;
+           }
++#endif // __HIP_STANDALONE_PIM__
+           try {
+-            numPlatforms = numDevices;
++#ifdef __HIP_ENABLE_PIM__
++            platformIds.resize(numDevices + 1);
++            hipDevice_t maxDeviceId = 0;
++#else  // __HIP_ENABLE_PIM__
+             platformIds.resize(numDevices);
+-
++#endif // __HIP_ENABLE_PIM__
+             for (int i = 0; i < numDevices; ++i) {
+               hipDevice_t device;
+               err = PI_CHECK_ERROR(hipDeviceGet(&device, i));
++#ifdef __HIP_ENABLE_PIM__
++              maxDeviceId = std::max(device, maxDeviceId);
++#endif // __HIP_ENABLE_PIM__
+               platformIds[i].devices_.emplace_back(
+                   new _pi_device{device, &platformIds[i]});
+             }
++#ifdef __HIP_ENABLE_PIM__
++            // PIM SDK currently does not have an API for device detection.
++            // If PIM was enabled through the build option, we assume that
++            // PIM is present and add a device for PIM.
++            // To obtain a unique device ID, add one to the max device ID.
++            hipDevice_t pimDevice = maxDeviceId + 1;
++            platformIds[numDevices].devices_.emplace_back(
++                new _pi_device{pimDevice, &platformIds[numDevices], true});
++            ++numDevices;
++#endif // __HIP_ENABLE_PIM__
++            numPlatforms = numDevices;
+           } catch (const std::bad_alloc &) {
+             // Signal out-of-memory situation
+             for (int i = 0; i < numDevices; ++i) {
+@@ -759,12 +782,11 @@ pi_result hip_piPlatformsGet(pi_uint32 num_entries, pi_platform *platforms,
+   }
+ }
+ 
+-pi_result hip_piPlatformGetInfo(pi_platform platform,
+-                                pi_platform_info param_name,
+-                                size_t param_value_size, void *param_value,
+-                                size_t *param_value_size_ret) {
+-  assert(platform != nullptr);
+-
++namespace {
++pi_result getGPUPlatformInfo(pi_platform platform, pi_platform_info param_name,
++                             size_t param_value_size, void *param_value,
++                             size_t *param_value_size_ret) {
++  (void)platform;
+   switch (param_name) {
+   case PI_PLATFORM_INFO_NAME:
+     return getInfo(param_value_size, param_value, param_value_size_ret,
+@@ -790,6 +812,58 @@ pi_result hip_piPlatformGetInfo(pi_platform platform,
+   return {};
+ }
+ 
++#ifdef __HIP_ENABLE_PIM__
++pi_result getPIMPlatformInfo(pi_platform platform, pi_platform_info param_name,
++                             size_t param_value_size, void *param_value,
++                             size_t *param_value_size_ret) {
++  (void)platform;
++  switch (param_name) {
++  case PI_PLATFORM_INFO_NAME:
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   "Samsung Host-Based PIM Extension");
++  case PI_PLATFORM_INFO_VENDOR:
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   "Samsung Electronics Ltd.");
++  case PI_PLATFORM_INFO_PROFILE:
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   "EMBEDDED PROFILE");
++  case PI_PLATFORM_INFO_VERSION: {
++    // Match the PIM SDK PIMLibrary version.
++    return getInfo(param_value_size, param_value, param_value_size_ret, "1.0");
++  }
++  case PI_PLATFORM_INFO_EXTENSIONS: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, "");
++  }
++  default:
++    __SYCL_PI_HANDLE_UNKNOWN_PARAM_NAME(param_name);
++  }
++  cl::sycl::detail::pi::die("Platform info request not implemented");
++  return {};
++}
++#endif // __HIP_ENABLE_PIM__
++
++} // anonymous namespace
++
++pi_result hip_piPlatformGetInfo(pi_platform platform,
++                                pi_platform_info param_name,
++                                size_t param_value_size, void *param_value,
++                                size_t *param_value_size_ret) {
++  assert(platform != nullptr);
++#ifdef __HIP_ENABLE_PIM__
++  if (platform->devices_.size() == 1 &&
++      platform->devices_.front()->is_pim_device()) {
++    return getPIMPlatformInfo(platform, param_name, param_value_size,
++                              param_value, param_value_size_ret);
++  } else {
++    return getGPUPlatformInfo(platform, param_name, param_value_size,
++                              param_value, param_value_size_ret);
++  }
++#else  // __HIP_ENABLE_PIM__
++  return getGPUPlatformInfo(platform, param_name, param_value_size, param_value,
++                            param_value_size_ret);
++#endif // __HIP_ENABLE_PIM__
++}
++
+ /// \param devices List of devices available on the system
+ /// \param num_devices Number of elements in the list of devices
+ /// Requesting a non-GPU device triggers an error, all PI HIP devices
+@@ -947,6 +1021,336 @@ pi_result hip_piDeviceRelease(pi_device device) {
+   return PI_SUCCESS;
+ }
+ 
++#ifdef __HIP_ENABLE_PIM__
++
++namespace {
++
++// Get information about the PIM device, if present. The information about the
++// PIM device is not available through the HIP API.
++pi_result getPIMDeviceInfo(pi_device device, pi_device_info param_name,
++                           size_t param_value_size, void *param_value,
++                           size_t *param_value_size_ret) {
++  switch (param_name) {
++  case PI_DEVICE_INFO_TYPE: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   PI_DEVICE_TYPE_CUSTOM);
++  }
++  case PI_DEVICE_INFO_VENDOR_ID: {
++    // 0x144d is Samsung's PCI vendor ID.
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   0x144du);
++  }
++  // TODO(Lukas, SP-14): See if there's any useful information or sensible
++  // default we can return for these.
++  case PI_DEVICE_INFO_MAX_WORK_ITEM_DIMENSIONS:
++  case PI_DEVICE_INFO_MAX_WORK_ITEM_SIZES:
++  case PI_EXT_ONEAPI_DEVICE_INFO_MAX_WORK_GROUPS_3D:
++  case PI_DEVICE_INFO_MAX_WORK_GROUP_SIZE:
++  case PI_DEVICE_INFO_MAX_NUM_SUB_GROUPS:
++  case PI_DEVICE_INFO_SUB_GROUP_SIZES_INTEL:
++  case PI_DEVICE_INFO_MAX_COMPUTE_UNITS: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_SUB_GROUP_INDEPENDENT_FORWARD_PROGRESS: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   PI_FALSE);
++  }
++  case PI_DEVICE_INFO_MAX_CLOCK_FREQUENCY: {
++#ifdef __HIP_STANDALONE_PIM__
++    // For systems that do not contain any actual AMD or PIM devices and just
++    // emulate the PIM hardware, return a value of 300 MHz. This value for the
++    // operating frequency of the PIM blocks was given in the paper *Hardware
++    // Architecture and Software Stack for PIM Based on Commercial DRAM
++    // Technology : Industrial Product* by Lee et al.
++    // https://ieeexplore.ieee.org/document/9499894
++    return getInfo(param_value_size, param_value, param_value_size_ret, 300u);
++#else  // __HIP_STANDALONE_PIM__
++    // On systems with AMD devices, we can query the HIP runtime for the memory
++    // clock rate. According to the paper, the PIM blocks will operate at the
++    // same frequency as the HBM2 DRAM.
++    // TODO(Lukas, SP-14): Check that this is the actual frequency of the
++    // memory, not the frequency of the memory bus (which is 4x higher).
++    int clock_freq = 0;
++    cl::sycl::detail::pi::assertion(
++        hipDeviceGetAttribute(&clock_freq, hipDeviceAttributeMemoryClockRate,
++                              device->get()) == hipSuccess);
++    cl::sycl::detail::pi::assertion(clock_freq >= 0);
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   pi_uint32(clock_freq) / 1000u);
++#endif // __HIP_STANDALONE_PIM__
++  }
++  case PI_DEVICE_INFO_PREFERRED_VECTOR_WIDTH_CHAR: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_PREFERRED_VECTOR_WIDTH_SHORT: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_PREFERRED_VECTOR_WIDTH_INT: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_PREFERRED_VECTOR_WIDTH_LONG: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_PREFERRED_VECTOR_WIDTH_FLOAT: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_PREFERRED_VECTOR_WIDTH_DOUBLE: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_PREFERRED_VECTOR_WIDTH_HALF: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 16u);
++  }
++  case PI_DEVICE_INFO_NATIVE_VECTOR_WIDTH_CHAR: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_NATIVE_VECTOR_WIDTH_SHORT: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_NATIVE_VECTOR_WIDTH_INT: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_NATIVE_VECTOR_WIDTH_LONG: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_NATIVE_VECTOR_WIDTH_FLOAT: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_NATIVE_VECTOR_WIDTH_DOUBLE: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_NATIVE_VECTOR_WIDTH_HALF: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 16u);
++  }
++  case PI_DEVICE_INFO_ADDRESS_BITS: {
++    auto bits = pi_uint32{std::numeric_limits<uintptr_t>::digits};
++    return getInfo(param_value_size, param_value, param_value_size_ret, bits);
++  }
++  case PI_DEVICE_INFO_MAX_MEM_ALLOC_SIZE: {
++    // TODO(Lukas, SP-14): Make sure we return a sensible value here.
++    auto maxAlloc = 1024u * 1024u * 1024u;
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   pi_uint64{maxAlloc});
++  }
++  case PI_DEVICE_INFO_IMAGE_SUPPORT: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   PI_FALSE);
++  }
++  // No image support on PIM.
++  case PI_DEVICE_INFO_MAX_READ_IMAGE_ARGS:
++  case PI_DEVICE_INFO_MAX_WRITE_IMAGE_ARGS:
++  case PI_DEVICE_INFO_IMAGE2D_MAX_HEIGHT:
++  case PI_DEVICE_INFO_IMAGE2D_MAX_WIDTH:
++  case PI_DEVICE_INFO_IMAGE3D_MAX_HEIGHT:
++  case PI_DEVICE_INFO_IMAGE3D_MAX_WIDTH:
++  case PI_DEVICE_INFO_IMAGE3D_MAX_DEPTH:
++  case PI_DEVICE_INFO_IMAGE_MAX_BUFFER_SIZE:
++  case PI_DEVICE_INFO_IMAGE_MAX_ARRAY_SIZE:
++  case PI_DEVICE_INFO_MAX_SAMPLERS:
++    return PI_INVALID_VALUE;
++
++  case PI_DEVICE_INFO_MAX_PARAMETER_SIZE: {
++    // __global__ function parameters are passed to the device via constant
++    // memory and are limited to 4 KB.
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   size_t{4000u});
++  }
++  case PI_DEVICE_INFO_MEM_BASE_ADDR_ALIGN: {
++    // TODO(Lukas, SP-14): Check if this value makes sense, but the PIM blocks
++    // operate at 256 bit/32 byte granularity.
++    return getInfo(param_value_size, param_value, param_value_size_ret, 32u);
++  }
++  case PI_DEVICE_INFO_HALF_FP_CONFIG: {
++    // Limited FP-16 capabilities on PIM.
++    auto config = PI_FP_ROUND_TO_NEAREST;
++    return getInfo(param_value_size, param_value, param_value_size_ret, config);
++  }
++  case PI_DEVICE_INFO_SINGLE_FP_CONFIG:
++  case PI_DEVICE_INFO_DOUBLE_FP_CONFIG: {
++    // No FP32 or FP64 support on PIM.
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_GLOBAL_MEM_CACHE_TYPE: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   CL_NONE);
++  }
++  case PI_DEVICE_INFO_GLOBAL_MEM_CACHELINE_SIZE: {
++    // There is no cache in the PIM blocks.
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_GLOBAL_MEM_CACHE_SIZE: {
++    // There is no cache in the PIM blocks.
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_GLOBAL_MEM_SIZE: {
++    // TODO(Lukas, SP-14): Check if the PIM memory is 8 or 16 GiB.
++    size_t bytes = 8ul * 1024ul * 1024ul * 1024ul;
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   pi_uint64{bytes});
++  }
++  // There is no constant memory in the PIM blocks.
++  case PI_DEVICE_INFO_MAX_CONSTANT_BUFFER_SIZE:
++  case PI_DEVICE_INFO_MAX_CONSTANT_ARGS: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_LOCAL_MEM_TYPE: {
++    // Note: There's no local memory in the PIM blocks, but NONE is not
++    // defined for the local memory type, so we just return 0 here.
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0);
++  }
++  case PI_DEVICE_INFO_LOCAL_MEM_SIZE: {
++    // There's no local memory in the PIM blocks.
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_ERROR_CORRECTION_SUPPORT: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   PI_FALSE);
++  }
++  case PI_DEVICE_INFO_HOST_UNIFIED_MEMORY: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   PI_FALSE);
++  }
++  case PI_DEVICE_INFO_PROFILING_TIMER_RESOLUTION: {
++    // Note: There are no profiling timers in the PIM blocks, so for now
++    // return 0 as the resolution.
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   size_t{0u});
++  }
++  case PI_DEVICE_INFO_ENDIAN_LITTLE: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   PI_TRUE);
++  }
++  case PI_DEVICE_INFO_AVAILABLE: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   PI_TRUE);
++  }
++  case PI_DEVICE_INFO_BUILD_ON_SUBDEVICE: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   PI_FALSE);
++  }
++  case PI_DEVICE_INFO_COMPILER_AVAILABLE: {
++    // Note: We could reflect the presence of the PIMCompiler here, but
++    // it's not really a device compiler in the SYCL/OpenCL sense.
++    // It's ok for custom devices to not have a compiler.
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   PI_FALSE);
++  }
++  case PI_DEVICE_INFO_LINKER_AVAILABLE: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   PI_FALSE);
++  }
++  case PI_DEVICE_INFO_EXECUTION_CAPABILITIES: {
++    // Note: The value returned here is less than the mandated minium capability
++    // (which would be CL_EXEC_KERNEL). Assuming this is ok for a custom device.
++    auto capability = CL_EXEC_KERNEL;
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   capability);
++  }
++  case PI_DEVICE_INFO_QUEUE_ON_DEVICE_PROPERTIES:
++  case PI_DEVICE_INFO_QUEUE_ON_HOST_PROPERTIES: {
++    // Note: The value returned here is less than the mandated minium
++    // capability, Assuming this is ok for a custom device.
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_BUILT_IN_KERNELS: {
++    // TODO(Lukas, SP-14): Can we return a list of the supported PIM operations
++    // here?
++    return getInfo(param_value_size, param_value, param_value_size_ret, "");
++  }
++  case PI_DEVICE_INFO_PLATFORM: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   device->get_platform());
++  }
++  case PI_DEVICE_INFO_NAME: {
++    const char *name = "Samsung Host-Based PIM";
++    return getInfoArray(strlen(name) + 1, param_value_size, param_value,
++                        param_value_size_ret, name);
++  }
++  case PI_DEVICE_INFO_VENDOR: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   "Samsung Inc.");
++  }
++  case PI_DEVICE_INFO_DRIVER_VERSION: {
++    // Match the PIM SDK PIMLibrary version.
++    return getInfo(param_value_size, param_value, param_value_size_ret, "1.0");
++  }
++  case PI_DEVICE_INFO_PROFILE: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, "PIM");
++  }
++  case PI_DEVICE_INFO_REFERENCE_COUNT: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   device->get_reference_count());
++  }
++  case PI_DEVICE_INFO_VERSION: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   "PI 0.0");
++  }
++  case PI_DEVICE_INFO_OPENCL_C_VERSION: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, "");
++  }
++  case PI_DEVICE_INFO_EXTENSIONS: {
++    // No extensions, so should probably return an empty string here.
++    return getInfo(param_value_size, param_value, param_value_size_ret, "");
++  }
++  case PI_DEVICE_INFO_PRINTF_BUFFER_SIZE: {
++    // The minimum value for the FULL profile is 1 MB.
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   size_t{0u});
++  }
++  case PI_DEVICE_INFO_PREFERRED_INTEROP_USER_SYNC: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   PI_TRUE);
++  }
++  case PI_DEVICE_INFO_PARENT_DEVICE: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   nullptr);
++  }
++  case PI_DEVICE_INFO_PARTITION_MAX_SUB_DEVICES: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_PARTITION_PROPERTIES: {
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   static_cast<cl_device_partition_property>(0u));
++  }
++  case PI_DEVICE_INFO_PARTITION_AFFINITY_DOMAIN: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  case PI_DEVICE_INFO_PARTITION_TYPE: {
++    // TODO: uncouple from OpenCL
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   static_cast<cl_device_partition_property>(0u));
++  }
++  case PI_DEVICE_INFO_USM_HOST_SUPPORT:
++  case PI_DEVICE_INFO_USM_DEVICE_SUPPORT:
++  case PI_DEVICE_INFO_USM_SINGLE_SHARED_SUPPORT:
++  case PI_DEVICE_INFO_USM_CROSS_SHARED_SUPPORT:
++  case PI_DEVICE_INFO_USM_SYSTEM_SHARED_SUPPORT: {
++    return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
++  }
++  // TODO: Implement.
++  case PI_DEVICE_INFO_ATOMIC_64:
++  case PI_DEVICE_INFO_ATOMIC_MEMORY_ORDER_CAPABILITIES:
++  // TODO: Investigate if this information is available on PIM.
++  case PI_DEVICE_INFO_ATOMIC_MEMORY_SCOPE_CAPABILITIES:
++  case PI_DEVICE_INFO_PCI_ADDRESS:
++  case PI_DEVICE_INFO_GPU_EU_COUNT:
++  case PI_DEVICE_INFO_GPU_EU_SIMD_WIDTH:
++  case PI_DEVICE_INFO_GPU_SLICES:
++  case PI_DEVICE_INFO_GPU_SUBSLICES_PER_SLICE:
++  case PI_DEVICE_INFO_GPU_EU_COUNT_PER_SUBSLICE:
++  case PI_DEVICE_INFO_GPU_HW_THREADS_PER_EU:
++  case PI_DEVICE_INFO_MAX_MEM_BANDWIDTH:
++    return PI_INVALID_VALUE;
++
++  default:
++    __SYCL_PI_HANDLE_UNKNOWN_PARAM_NAME(param_name);
++  }
++  cl::sycl::detail::pi::die("Device info request not implemented");
++  return {};
++}
++} // anonymous namespace
++
++#endif // __HIP_ENABLE_PIM__
++
+ pi_result hip_piDeviceGetInfo(pi_device device, pi_device_info param_name,
+                               size_t param_value_size, void *param_value,
+                               size_t *param_value_size_ret) {
+@@ -955,6 +1359,13 @@ pi_result hip_piDeviceGetInfo(pi_device device, pi_device_info param_name,
+ 
+   assert(device != nullptr);
+ 
++#ifdef __HIP_ENABLE_PIM__
++  if (device->is_pim_device()) {
++    return getPIMDeviceInfo(device, param_name, param_value_size, param_value,
++                            param_value_size_ret);
++  }
++#endif // __HIP_ENABLE_PIM__
++
+   switch (param_name) {
+   case PI_DEVICE_INFO_TYPE: {
+     return getInfo(param_value_size, param_value, param_value_size_ret,
+diff --git a/sycl/plugins/hip/pi_hip.hpp b/sycl/plugins/hip/pi_hip.hpp
+index c54300157cd3..f0a315f6f393 100644
+--- a/sycl/plugins/hip/pi_hip.hpp
++++ b/sycl/plugins/hip/pi_hip.hpp
+@@ -72,15 +72,28 @@ private:
+   std::atomic_uint32_t refCount_;
+   pi_platform platform_;
+ 
++#ifdef __HIP_ENABLE_PIM__
++  bool isPim_;
++#endif // __HIP_ENABLE_PIM__
++
+ public:
++#ifdef __HIP_ENABLE_PIM__
++  _pi_device(native_type cuDevice, pi_platform platform, bool pim = false)
++      : cuDevice_(cuDevice), refCount_{1}, platform_(platform), isPim_(pim) {}
++#else  // __HIP_ENABLE_PIM
+   _pi_device(native_type cuDevice, pi_platform platform)
+       : cuDevice_(cuDevice), refCount_{1}, platform_(platform) {}
++#endif // __HIP_ENABLE_PIM__
+ 
+   native_type get() const noexcept { return cuDevice_; };
+ 
+   pi_uint32 get_reference_count() const noexcept { return refCount_; }
+ 
+   pi_platform get_platform() const noexcept { return platform_; };
++
++#ifdef __HIP_ENABLE_PIM__
++  bool is_pim_device() const noexcept { return isPim_; }
++#endif // __HIP_ENABLE_PIM__
+ };
+ 
+ /// PI context mapping to a HIP context object.
+diff --git a/sycl/tools/sycl-ls/sycl-ls.cpp b/sycl/tools/sycl-ls/sycl-ls.cpp
+index 63e53f684566..4fca85839a8d 100644
+--- a/sycl/tools/sycl-ls/sycl-ls.cpp
++++ b/sycl/tools/sycl-ls/sycl-ls.cpp
+@@ -50,6 +50,8 @@ std::string getDeviceTypeName(const device &Device) {
+     return "host";
+   case info::device_type::accelerator:
+     return "acc";
++  case info::device_type::custom:
++    return "custom";
+   default:
+     return "unknown";
+   }
+@@ -170,6 +172,7 @@ int main(int argc, char **argv) {
+   printSelectorChoice(accelerator_selector(), "accelerator_selector()  : ");
+   printSelectorChoice(cpu_selector(), "cpu_selector()          : ");
+   printSelectorChoice(gpu_selector(), "gpu_selector()          : ");
++  // TODO(Lukas): Print custom/PIM selector choice.
+ 
+   // Print trivial custom selectors choice
+   printSelectorChoice(custom_selector(info::device_type::gpu),
+diff --git a/sycl/unittests/pi/CMakeLists.txt b/sycl/unittests/pi/CMakeLists.txt
+index 327b52ed504e..5c5cb40b5ab1 100644
+--- a/sycl/unittests/pi/CMakeLists.txt
++++ b/sycl/unittests/pi/CMakeLists.txt
+@@ -12,6 +12,19 @@ add_dependencies(PiTests sycl)
+ target_include_directories(PiTests PRIVATE SYSTEM ${sycl_inc_dir})
+ target_include_directories(PiTests PRIVATE ${sycl_src_dir}/../tools/xpti_helpers)
+ 
++# This option is only evaluated on the AMD platform because currently,
++# there's no Nvidia device with Samsung PIM.
++if(SYCL_HIP_PI_ENABLE_PIM)
++  target_compile_definitions(PiTests PRIVATE __HIP_ENABLE_PIM__)
++endif()
++
++# This option is only evaluated on the AMD platform because currently,
++# there's no Nvidia device with Samsung PIM.
++if(SYCL_HIP_PI_STANDALONE_PIM AND SYCL_HIP_PI_ENABLE_PIM)
++  message(STATUS "PIM STANDALONE")
++  target_compile_definitions(PiTests PRIVATE __HIP_STANDALONE_PIM__)
++endif()
++
+ if("cuda" IN_LIST SYCL_ENABLE_PLUGINS)
+     add_subdirectory(cuda)
+ endif()
+diff --git a/sycl/unittests/pi/EnqueueMemTest.cpp b/sycl/unittests/pi/EnqueueMemTest.cpp
+index 5e001acc2ba9..a0015d71cf3e 100644
+--- a/sycl/unittests/pi/EnqueueMemTest.cpp
++++ b/sycl/unittests/pi/EnqueueMemTest.cpp
+@@ -32,6 +32,17 @@ protected:
+ 
+     detail::plugin plugin = GetParam();
+ 
++#ifdef __HIP_STANDALONE_PIM__
++    bool skipTest = plugin.getBackend() == cl::sycl::backend::ext_oneapi_hip;
++#else  // __HIP_STANDALONE_PIM__
++    bool skipTest = false;
++#endif // __HIP_STANDALONE_PIM__
++
++    if (skipTest) {
++      GTEST_SKIP() << "Skipping test for standalone PIM device";
++      return;
++    }
++
+     pi_platform platform = nullptr;
+     ASSERT_EQ((plugin.call_nocheck<detail::PiApiKind::piPlatformsGet>(
+                   1, &platform, nullptr)),
+@@ -61,6 +72,16 @@ protected:
+ 
+     detail::plugin plugin = GetParam();
+ 
++#ifdef __HIP_STANDALONE_PIM__
++    bool skipTest = plugin.getBackend() == cl::sycl::backend::ext_oneapi_hip;
++#else  // __HIP_STANDALONE_PIM__
++    bool skipTest = false;
++#endif // __HIP_STANDALONE_PIM__
++
++    if (skipTest) {
++      return;
++    }
++
+     ASSERT_EQ((plugin.call_nocheck<detail::PiApiKind::piMemRelease>(_mem)),
+               PI_SUCCESS);
+     ASSERT_EQ((plugin.call_nocheck<detail::PiApiKind::piQueueRelease>(_queue)),
+-- 
+2.17.1
+

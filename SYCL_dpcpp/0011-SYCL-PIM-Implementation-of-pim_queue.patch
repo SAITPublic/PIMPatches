@@ -1,0 +1,642 @@
+From 90fda3304dfddc84744f443f69d242cdf00dc778 Mon Sep 17 00:00:00 2001
+From: Lukas Sommer <lukas.sommer@codeplay.com>
+Date: Fri, 29 Jul 2022 14:52:08 +0000
+Subject: [PATCH 11/17] [SYCL][PIM] Implementation of pim_queue
+
+---
+ sycl/include/CL/sycl.hpp                      |  1 +
+ .../CL/sycl/detail/device_selection.hpp       | 49 ++++++++++
+ sycl/include/CL/sycl/device_selector.hpp      |  4 -
+ sycl/include/CL/sycl/queue.hpp                | 12 +++
+ .../sycl/ext/samsung/pim/pim_queue.hpp        | 68 ++++++++++++++
+ sycl/plugins/hip/pi_hip.cpp                   |  2 +-
+ sycl/source/CMakeLists.txt                    |  2 +
+ sycl/source/detail/device_selection.cpp       | 82 +++++++++++++++++
+ sycl/source/detail/pim_queue_impl.hpp         | 54 +++++++++++
+ sycl/source/detail/queue_impl.hpp             | 17 ++--
+ sycl/source/device_selector.cpp               | 90 ++++---------------
+ sycl/source/pim_queue.cpp                     | 33 +++++++
+ 12 files changed, 328 insertions(+), 86 deletions(-)
+ create mode 100644 sycl/include/CL/sycl/detail/device_selection.hpp
+ create mode 100644 sycl/include/sycl/ext/samsung/pim/pim_queue.hpp
+ create mode 100644 sycl/source/detail/device_selection.cpp
+ create mode 100644 sycl/source/detail/pim_queue_impl.hpp
+ create mode 100644 sycl/source/pim_queue.cpp
+
+diff --git a/sycl/include/CL/sycl.hpp b/sycl/include/CL/sycl.hpp
+index 07552f66c24f..62aa6ad58862 100644
+--- a/sycl/include/CL/sycl.hpp
++++ b/sycl/include/CL/sycl.hpp
+@@ -74,4 +74,5 @@
+ #if SYCL_EXT_SAMSUNG_PIM
+ #include <sycl/ext/samsung/pim/pim_handler.hpp>
+ #include <sycl/ext/samsung/pim/pim_accessor.hpp>
++#include <sycl/ext/samsung/pim/pim_queue.hpp>
+ #endif
+diff --git a/sycl/include/CL/sycl/detail/device_selection.hpp b/sycl/include/CL/sycl/detail/device_selection.hpp
+new file mode 100644
+index 000000000000..4edd7c7a7dbe
+--- /dev/null
++++ b/sycl/include/CL/sycl/detail/device_selection.hpp
+@@ -0,0 +1,49 @@
++//==----------- device_selection.hpp - SYCL device selection helpers -------==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#pragma once
++
++#include <CL/sycl/device.hpp>
++#include <type_traits>
++
++__SYCL_INLINE_NAMESPACE(cl) {
++namespace sycl {
++namespace detail {
++
++// SYCL 1.2.1 defines a negative score to reject a device from selection
++static constexpr int REJECT_DEVICE_SCORE = -1;
++
++// Type trait to check if a type is suitable for a device selector, i.e., it is
++// a callable taking a const device reference and returning an int.
++#if __cplusplus >= 201703L
++template <typename DeviceSelector>
++using is_device_selector =
++    std::is_invocable_r<int, DeviceSelector, const sycl::device &>;
++#else
++// C++14 does not have is_invocable_r
++template <typename R, typename F, typename... Args>
++using is_invocable_r = std::is_constructible<std::function<R(Args...)>, F>;
++
++template <typename DeviceSelector>
++using is_device_selector =
++    is_invocable_r<int, DeviceSelector, const sycl::device &>;
++#endif
++
++// Utility function to check if device is of the preferred backend.
++// Currently preference is given to the level_zero backend.
++bool isDeviceOfPreferredSyclBe(const device &Device);
++
++using selector_func_t = std::function<int(const device &)>;
++// Utility function to score all available devices with the given selector and
++// choose the device with the highest score. Will throw if no suitable device is
++// available.
++__SYCL_EXPORT device select_device(const selector_func_t &selector);
++
++} // namespace detail
++} // namespace sycl
++} // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/include/CL/sycl/device_selector.hpp b/sycl/include/CL/sycl/device_selector.hpp
+index 319cfd31ccf8..a1852cea3663 100644
+--- a/sycl/include/CL/sycl/device_selector.hpp
++++ b/sycl/include/CL/sycl/device_selector.hpp
+@@ -27,10 +27,6 @@ class device;
+ ///
+ /// \ingroup sycl_api_dev_sel
+ class __SYCL_EXPORT device_selector {
+-protected:
+-  // SYCL 1.2.1 defines a negative score to reject a device from selection
+-  static constexpr int REJECT_DEVICE_SCORE = -1;
+-
+ public:
+   virtual ~device_selector() = default;
+ 
+diff --git a/sycl/include/CL/sycl/queue.hpp b/sycl/include/CL/sycl/queue.hpp
+index 212db7207210..16d873d33da3 100644
+--- a/sycl/include/CL/sycl/queue.hpp
++++ b/sycl/include/CL/sycl/queue.hpp
+@@ -84,6 +84,14 @@ class context;
+ class device;
+ class queue;
+ 
++#if SYCL_EXT_SAMSUNG_PIM
++namespace ext {
++namespace samsung {
++class pim_queue;
++}
++} // namespace ext
++#endif // SYCL_EXT_SAMSUNG_PIM
++
+ namespace detail {
+ class queue_impl;
+ #if __SYCL_USE_FALLBACK_ASSERT
+@@ -1082,6 +1090,10 @@ private:
+                                            const detail::code_location &);
+ #endif
+ 
++#if SYCL_EXT_SAMSUNG_PIM
++  friend ext::samsung::pim_queue;
++#endif // SYCL_EXT_SAMSUNG_PIM
++
+   /// A template-free version of submit.
+   event submit_impl(std::function<void(handler &)> CGH,
+                     const detail::code_location &CodeLoc);
+diff --git a/sycl/include/sycl/ext/samsung/pim/pim_queue.hpp b/sycl/include/sycl/ext/samsung/pim/pim_queue.hpp
+new file mode 100644
+index 000000000000..b76e10f89fec
+--- /dev/null
++++ b/sycl/include/sycl/ext/samsung/pim/pim_queue.hpp
+@@ -0,0 +1,68 @@
++//== pim_queue.hpp --- SYCL queue wrapping a PIM device and a regular queue ==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#pragma once
++
++#include <CL/sycl/detail/device_selection.hpp>
++#include <CL/sycl/queue.hpp>
++
++__SYCL_INLINE_NAMESPACE(cl) {
++namespace sycl {
++namespace detail {
++class queue_impl;
++} // namespace detail
++namespace ext {
++namespace samsung {
++
++// Inherits from queue and essentially wraps two different queues: One for a PIM
++// device and one for an alternative device. Calls to submit with command-group
++// functions requiring a pim_handler will be submitted to the PIM device queue.
++// All other calls to submit or any other public member function defined for
++// sycl::queue by the SYCL specification will be submitted to the queue for the
++// alternative device (e.g., GPU).
++class __SYCL_EXPORT pim_queue : public queue {
++
++public:
++  template <
++      typename PIMDeviceSelector, typename GPUDeviceSelector,
++      std::enable_if_t<detail::is_device_selector<PIMDeviceSelector>::value,
++                       bool> = true,
++      std::enable_if_t<detail::is_device_selector<GPUDeviceSelector>::value,
++                       bool> = true>
++  pim_queue(const PIMDeviceSelector &PimSelector,
++            const GPUDeviceSelector &GpuSelector,
++            const property_list &PropList = {})
++      : pim_queue{PimSelector, GpuSelector, async_handler{}, PropList} {}
++
++  template <
++      typename PIMDeviceSelector, typename GPUDeviceSelector,
++      std::enable_if_t<detail::is_device_selector<PIMDeviceSelector>::value,
++                       bool> = true,
++      std::enable_if_t<detail::is_device_selector<GPUDeviceSelector>::value,
++                       bool> = true>
++  pim_queue(const PIMDeviceSelector &PimSelector,
++            const GPUDeviceSelector &GpuSelector,
++            const async_handler &AsyncHandler,
++            const property_list &PropList = {})
++      : pim_queue{detail::select_device(PimSelector),
++                  detail::select_device(GpuSelector), AsyncHandler, PropList} {}
++
++  queue &get_pim_queue() { return MPimQueue; }
++
++  queue &get_gpu_queue() { return *this; }
++
++private:
++  pim_queue(const device &PimDevice, const device &GpuDevice,
++            const async_handler &AsyncHandler, const property_list &PropList);
++
++  sycl::queue MPimQueue;
++};
++} // namespace samsung
++} // namespace ext
++} // namespace sycl
++} // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/plugins/hip/pi_hip.cpp b/sycl/plugins/hip/pi_hip.cpp
+index efd4612dfb94..565248e732b4 100644
+--- a/sycl/plugins/hip/pi_hip.cpp
++++ b/sycl/plugins/hip/pi_hip.cpp
+@@ -1557,7 +1557,7 @@ pi_result getPIMDeviceInfo(pi_device device, pi_device_info param_name,
+     // just used here to mark the device as a PIM device and build a SYCL aspect
+     // on top of it.
+     return getInfo(param_value_size, param_value, param_value_size_ret,
+-                   "samsung_pim");
++                   "samsung_pim, cl_khr_fp16");
+   }
+   case PI_DEVICE_INFO_PRINTF_BUFFER_SIZE: {
+     // The minimum value for the FULL profile is 1 MB.
+diff --git a/sycl/source/CMakeLists.txt b/sycl/source/CMakeLists.txt
+index 185ec4f0f714..725dd5078292 100644
+--- a/sycl/source/CMakeLists.txt
++++ b/sycl/source/CMakeLists.txt
+@@ -153,6 +153,7 @@ set(SYCL_SOURCES
+     "detail/device_filter.cpp"
+     "detail/device_global_map.cpp"
+     "detail/device_impl.cpp"
++    "detail/device_selection.cpp"
+     "detail/error_handling/enqueue_kernel.cpp"
+     "detail/event_impl.cpp"
+     "detail/filter_selector_impl.cpp"
+@@ -202,6 +203,7 @@ set(SYCL_SOURCES
+     "kernel.cpp"
+     "kernel_bundle.cpp"
+     "pim_handler.cpp"
++    "pim_queue.cpp"
+     "platform.cpp"
+     "program.cpp"
+     "queue.cpp"
+diff --git a/sycl/source/detail/device_selection.cpp b/sycl/source/detail/device_selection.cpp
+new file mode 100644
+index 000000000000..31c7e8975bb5
+--- /dev/null
++++ b/sycl/source/detail/device_selection.cpp
+@@ -0,0 +1,82 @@
++//==------------------- device_selection.cpp -------------------------------==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include <CL/sycl/detail/device_selection.hpp>
++#include <detail/device_impl.hpp>
++
++__SYCL_INLINE_NAMESPACE(cl) {
++namespace sycl {
++namespace detail {
++
++bool isDeviceOfPreferredSyclBe(const device &Device) {
++  if (Device.is_host())
++    return false;
++
++  return detail::getSyclObjImpl(Device)->getPlugin().getBackend() ==
++         backend::ext_oneapi_level_zero;
++}
++
++device select_device(const selector_func_t &selector) {
++  std::vector<device> devices = device::get_devices();
++  int score = REJECT_DEVICE_SCORE;
++  const device *res = nullptr;
++
++  for (const auto &dev : devices) {
++    int dev_score = selector(dev);
++
++    if (detail::pi::trace(detail::pi::TraceLevel::PI_TRACE_ALL)) {
++      std::string PlatformName = dev.get_info<info::device::platform>()
++                                     .get_info<info::platform::name>();
++      std::string DeviceName = dev.get_info<info::device::name>();
++      std::cout << "SYCL_PI_TRACE[all]: "
++                << "select_device(): -> score = " << dev_score
++                << ((dev_score < 0) ? " (REJECTED)" : "") << std::endl
++                << "SYCL_PI_TRACE[all]: "
++                << "  platform: " << PlatformName << std::endl
++                << "SYCL_PI_TRACE[all]: "
++                << "  device: " << DeviceName << std::endl;
++    }
++
++    // A negative score means that a device must not be selected.
++    if (dev_score < 0) {
++      continue;
++    }
++
++    // SYCL spec says: "If more than one device receives the high score then
++    // one of those tied devices will be returned, but which of the devices
++    // from the tied set is to be returned is not defined". Here we give a
++    // preference to the device of the preferred BE.
++    //
++    if ((score < dev_score) ||
++        (score == dev_score && isDeviceOfPreferredSyclBe(dev))) {
++      res = &dev;
++      score = dev_score;
++    }
++  }
++
++  if (res != nullptr) {
++    if (detail::pi::trace(detail::pi::TraceLevel::PI_TRACE_BASIC)) {
++      std::string PlatformName = res->get_info<info::device::platform>()
++                                     .get_info<info::platform::name>();
++      std::string DeviceName = res->get_info<info::device::name>();
++      std::cout << "SYCL_PI_TRACE[all]: "
++                << "Selected device ->" << std::endl
++                << "SYCL_PI_TRACE[all]: "
++                << "  platform: " << PlatformName << std::endl
++                << "SYCL_PI_TRACE[all]: "
++                << "  device: " << DeviceName << std::endl;
++    }
++    return *res;
++  }
++
++  throw cl::sycl::runtime_error("No device of requested type available.",
++                                PI_DEVICE_NOT_FOUND);
++}
++} // namespace detail
++} // namespace sycl
++} // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/source/detail/pim_queue_impl.hpp b/sycl/source/detail/pim_queue_impl.hpp
+new file mode 100644
+index 000000000000..9e524dec2025
+--- /dev/null
++++ b/sycl/source/detail/pim_queue_impl.hpp
+@@ -0,0 +1,54 @@
++//==- pim_queue_impl.hpp - SYCL queue wrapping a PIM and a regular device --==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#pragma once
++
++#include <detail/queue_impl.hpp>
++
++__SYCL_INLINE_NAMESPACE(cl) {
++namespace sycl {
++namespace detail {
++
++// Implementation of the pim_queue, inhertis from queue_impl. Holds a (shared)
++// pointer to the queue for the actual PIM device and will delegate all
++// submissions requiring a pim_handler for the command-group function to the PIM
++// queue.
++class pim_queue_impl : public queue_impl {
++public:
++  pim_queue_impl(const DeviceImplPtr &Device, const async_handler &AsyncHandler,
++                 const property_list &PropList,
++                 std::shared_ptr<detail::queue_impl> PimQueue)
++      : queue_impl{Device, AsyncHandler, PropList}, MPimQueue{PimQueue} {}
++
++  event submit_impl(const std::function<void(ext::samsung::pim_handler &)> &CGF,
++                    const std::shared_ptr<queue_impl> &Self,
++                    const std::shared_ptr<queue_impl> &PrimaryQueue,
++                    const std::shared_ptr<queue_impl> &SecondaryQueue,
++                    const detail::code_location &Loc,
++                    const SubmitPostProcessF *PostProcess) override {
++    // Instead of submitting the CGF to this queue, this implementation
++    // delegates the submission to the queue for the PIM device.
++    if (Self == SecondaryQueue) {
++      // This is the already the second attempt to submit this CGF, so treat the
++      // the PIM queue as the secondary queue.
++      return MPimQueue->submit_impl(CGF, MPimQueue, PrimaryQueue, MPimQueue,
++                                    Loc, PostProcess);
++    }
++    // This is the first attempt to submit this CFG, allow the PIM queue to fail
++    // and fall back to the secondary queue.
++    return MPimQueue->submit(CGF, MPimQueue, SecondaryQueue, Loc, PostProcess);
++  }
++
++  std::shared_ptr<detail::queue_impl> pim_queue() const { return MPimQueue; }
++
++private:
++  std::shared_ptr<detail::queue_impl> MPimQueue;
++};
++} // namespace detail
++} // namespace sycl
++} // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/source/detail/queue_impl.hpp b/sycl/source/detail/queue_impl.hpp
+index 30e77f6f0333..50cf3034f835 100644
+--- a/sycl/source/detail/queue_impl.hpp
++++ b/sycl/source/detail/queue_impl.hpp
+@@ -575,12 +575,15 @@ private:
+   }
+ 
+ #if SYCL_EXT_SAMSUNG_PIM
+-  event submit_impl(const std::function<void(ext::samsung::pim_handler &)> &CGF,
+-                    const std::shared_ptr<queue_impl> &Self,
+-                    const std::shared_ptr<queue_impl> &PrimaryQueue,
+-                    const std::shared_ptr<queue_impl> &SecondaryQueue,
+-                    const detail::code_location &Loc,
+-                    const SubmitPostProcessF *PostProcess) {
++  // This function needs to be virtual, so the pim_queue_impl can override this
++  // and dispatch this call to the actual PIM queue/device.
++  virtual event
++  submit_impl(const std::function<void(ext::samsung::pim_handler &)> &CGF,
++              const std::shared_ptr<queue_impl> &Self,
++              const std::shared_ptr<queue_impl> &PrimaryQueue,
++              const std::shared_ptr<queue_impl> &SecondaryQueue,
++              const detail::code_location &Loc,
++              const SubmitPostProcessF *PostProcess) {
+     ext::samsung::pim_handler Handler{Self};
+     Handler.saveCodeLoc(Loc);
+     CGF(Handler);
+@@ -666,6 +669,8 @@ private:
+ 
+   const bool MIsInorder;
+ 
++  friend class pim_queue_impl;
++
+ public:
+   // Queue constructed with the discard_events property
+   const bool MDiscardEvents;
+diff --git a/sycl/source/device_selector.cpp b/sycl/source/device_selector.cpp
+index 9fb9ecef1296..4c76e3f8538e 100644
+--- a/sycl/source/device_selector.cpp
++++ b/sycl/source/device_selector.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <CL/sycl/backend_types.hpp>
+ #include <CL/sycl/detail/device_filter.hpp>
++#include <CL/sycl/detail/device_selection.hpp>
+ #include <CL/sycl/device.hpp>
+ #include <CL/sycl/device_selector.hpp>
+ #include <CL/sycl/exception.hpp>
+@@ -27,70 +28,9 @@
+ __SYCL_INLINE_NAMESPACE(cl) {
+ namespace sycl {
+ 
+-// Utility function to check if device is of the preferred backend.
+-// Currently preference is given to the level_zero backend.
+-static bool isDeviceOfPreferredSyclBe(const device &Device) {
+-  if (Device.is_host())
+-    return false;
+-
+-  return detail::getSyclObjImpl(Device)->getPlugin().getBackend() ==
+-         backend::ext_oneapi_level_zero;
+-}
+-
+ device device_selector::select_device() const {
+-  std::vector<device> devices = device::get_devices();
+-  int score = REJECT_DEVICE_SCORE;
+-  const device *res = nullptr;
+-
+-  for (const auto &dev : devices) {
+-    int dev_score = (*this)(dev);
+-
+-    if (detail::pi::trace(detail::pi::TraceLevel::PI_TRACE_ALL)) {
+-      std::string PlatformName = dev.get_info<info::device::platform>()
+-                                     .get_info<info::platform::name>();
+-      std::string DeviceName = dev.get_info<info::device::name>();
+-      std::cout << "SYCL_PI_TRACE[all]: "
+-                << "select_device(): -> score = " << dev_score
+-                << ((dev_score < 0) ? " (REJECTED)" : "") << std::endl
+-                << "SYCL_PI_TRACE[all]: "
+-                << "  platform: " << PlatformName << std::endl
+-                << "SYCL_PI_TRACE[all]: "
+-                << "  device: " << DeviceName << std::endl;
+-    }
+-
+-    // A negative score means that a device must not be selected.
+-    if (dev_score < 0)
+-      continue;
+-
+-    // SYCL spec says: "If more than one device receives the high score then
+-    // one of those tied devices will be returned, but which of the devices
+-    // from the tied set is to be returned is not defined". Here we give a
+-    // preference to the device of the preferred BE.
+-    //
+-    if ((score < dev_score) ||
+-        (score == dev_score && isDeviceOfPreferredSyclBe(dev))) {
+-      res = &dev;
+-      score = dev_score;
+-    }
+-  }
+-
+-  if (res != nullptr) {
+-    if (detail::pi::trace(detail::pi::TraceLevel::PI_TRACE_BASIC)) {
+-      std::string PlatformName = res->get_info<info::device::platform>()
+-                                     .get_info<info::platform::name>();
+-      std::string DeviceName = res->get_info<info::device::name>();
+-      std::cout << "SYCL_PI_TRACE[all]: "
+-                << "Selected device ->" << std::endl
+-                << "SYCL_PI_TRACE[all]: "
+-                << "  platform: " << PlatformName << std::endl
+-                << "SYCL_PI_TRACE[all]: "
+-                << "  device: " << DeviceName << std::endl;
+-    }
+-    return *res;
+-  }
+-
+-  throw cl::sycl::runtime_error("No device of requested type available.",
+-                                PI_DEVICE_NOT_FOUND);
++  return detail::select_device(
++      [&](const device &dev) -> int { return (*this)(dev); });
+ }
+ 
+ /// Devices of different kinds are prioritized in the following order:
+@@ -99,10 +39,10 @@ device device_selector::select_device() const {
+ /// 3. Host
+ int default_selector::operator()(const device &dev) const {
+ 
+-  int Score = REJECT_DEVICE_SCORE;
++  int Score = detail::REJECT_DEVICE_SCORE;
+ 
+   // Give preference to device of SYCL BE.
+-  if (isDeviceOfPreferredSyclBe(dev))
++  if (detail::isDeviceOfPreferredSyclBe(dev))
+     Score = 50;
+ 
+   // If SYCL_DEVICE_FILTER is set, filter device gets a high point.
+@@ -136,53 +76,53 @@ int default_selector::operator()(const device &dev) const {
+ }
+ 
+ int gpu_selector::operator()(const device &dev) const {
+-  int Score = REJECT_DEVICE_SCORE;
++  int Score = detail::REJECT_DEVICE_SCORE;
+ 
+   if (dev.is_gpu()) {
+     // device::get_devices returns filtered list of devices.
+     Score = 1000;
+     // Give preference to device of SYCL BE.
+-    if (isDeviceOfPreferredSyclBe(dev))
++    if (detail::isDeviceOfPreferredSyclBe(dev))
+       Score += 50;
+   }
+   return Score;
+ }
+ 
+ int cpu_selector::operator()(const device &dev) const {
+-  int Score = REJECT_DEVICE_SCORE;
++  int Score = detail::REJECT_DEVICE_SCORE;
+ 
+   if (dev.is_cpu()) {
+     // device::get_devices returns filtered list of devices.
+     Score = 1000;
+ 
+     // Give preference to device of SYCL BE.
+-    if (isDeviceOfPreferredSyclBe(dev))
++    if (detail::isDeviceOfPreferredSyclBe(dev))
+       Score += 50;
+   }
+   return Score;
+ }
+ 
+ int accelerator_selector::operator()(const device &dev) const {
+-  int Score = REJECT_DEVICE_SCORE;
++  int Score = detail::REJECT_DEVICE_SCORE;
+ 
+   if (dev.is_accelerator()) {
+     // device::get_devices returns filtered list of devices.
+     Score = 1000;
+ 
+     // Give preference to device of SYCL BE.
+-    if (isDeviceOfPreferredSyclBe(dev))
++    if (detail::isDeviceOfPreferredSyclBe(dev))
+       Score += 50;
+   }
+   return Score;
+ }
+ 
+ int host_selector::operator()(const device &dev) const {
+-  int Score = REJECT_DEVICE_SCORE;
++  int Score = detail::REJECT_DEVICE_SCORE;
+ 
+   if (dev.is_host()) {
+     Score = 1000;
+     // Give preference to device of SYCL BE.
+-    if (isDeviceOfPreferredSyclBe(dev))
++    if (detail::isDeviceOfPreferredSyclBe(dev))
+       Score += 50;
+   }
+   return Score;
+@@ -192,12 +132,12 @@ int host_selector::operator()(const device &dev) const {
+ namespace ext {
+ namespace samsung {
+ int pim_selector::operator()(const device &dev) const {
+-  int Score = REJECT_DEVICE_SCORE;
++  int Score = detail::REJECT_DEVICE_SCORE;
+ 
+   if (dev.has(sycl::aspect::ext_samsung_pim)) {
+     Score = 1000;
+     // Give preference to device of SYCL BE.
+-    if (isDeviceOfPreferredSyclBe(dev)) {
++    if (detail::isDeviceOfPreferredSyclBe(dev)) {
+       Score += 50;
+     }
+   }
+diff --git a/sycl/source/pim_queue.cpp b/sycl/source/pim_queue.cpp
+new file mode 100644
+index 000000000000..e42c9930260e
+--- /dev/null
++++ b/sycl/source/pim_queue.cpp
+@@ -0,0 +1,33 @@
++//==-------------- pim_queue.cpp -------------------------------------------==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include <detail/pim_queue_impl.hpp>
++#include <sycl/ext/samsung/pim/pim_queue.hpp>
++
++__SYCL_INLINE_NAMESPACE(cl) {
++namespace sycl {
++namespace ext {
++namespace samsung {
++
++pim_queue::pim_queue(const device &PimDevice, const device &GpuDevice,
++                     const async_handler &AsyncHandler,
++                     const property_list &PropList)
++    : queue(std::make_shared<detail::pim_queue_impl>(
++          detail::getSyclObjImpl(GpuDevice), AsyncHandler, PropList,
++          std::make_shared<detail::queue_impl>(
++              detail::getSyclObjImpl(PimDevice), AsyncHandler, PropList))) {
++  // It's safe to use the static cast here, because we have just initialized
++  // 'impl' with a pim_queue_impl.
++  MPimQueue = detail::createSyclObjFromImpl<sycl::queue>(
++      static_cast<detail::pim_queue_impl *>(impl.get())->pim_queue());
++}
++
++} // namespace samsung
++} // namespace ext
++} // namespace sycl
++} // __SYCL_INLINE_NAMESPACE(cl)
+-- 
+2.17.1
+

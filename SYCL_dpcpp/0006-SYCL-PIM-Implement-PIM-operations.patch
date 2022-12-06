@@ -1,0 +1,564 @@
+From 7acae435121d5d1d3b894b8f2aaad57e5d553bee Mon Sep 17 00:00:00 2001
+From: Lukas Sommer <lukas.sommer@codeplay.com>
+Date: Mon, 20 Jun 2022 08:36:41 +0000
+Subject: [PATCH 06/17] [SYCL][PIM] Implement PIM operations;
+
+Implements the PIM operations as member functions
+of `pim_handler`, as defined by the PIM SYCL extension.
+
+A PIM operation is considered as a regular command,
+with the argument `pim_accessor`s setting up requirements
+and dependency tracking.
+---
+ sycl/include/CL/sycl/detail/cg.hpp            |  27 +++
+ .../sycl/ext/samsung/pim/pim_handler.hpp      | 167 +++++++++++++++++-
+ sycl/source/detail/config.cpp                 |   5 +-
+ sycl/source/detail/config.hpp                 |   2 +-
+ sycl/source/detail/scheduler/commands.cpp     | 109 +++++++++++-
+ sycl/source/detail/scheduler/commands.hpp     |   8 +
+ sycl/source/pim_handler.cpp                   |  30 +++-
+ sycl/unittests/allowlist/ParseAllowList.cpp   |   1 +
+ 8 files changed, 327 insertions(+), 22 deletions(-)
+
+diff --git a/sycl/include/CL/sycl/detail/cg.hpp b/sycl/include/CL/sycl/detail/cg.hpp
+index c8d685f3a167..0e252aed7820 100644
+--- a/sycl/include/CL/sycl/detail/cg.hpp
++++ b/sycl/include/CL/sycl/detail/cg.hpp
+@@ -523,6 +523,33 @@ public:
+         MEventsWaitWithBarrier(std::move(EventsWaitWithBarrier)) {}
+ };
+ 
++class CGPim : public CG {
++public:
++  enum class PIM_OPERATION {
++    NOP,
++    ELT_VEC_ADD,
++    ELT_SCALAR_ADD,
++    ELT_VEC_MUL,
++    ELT_SCALAR_MUL,
++    GEMV,
++  };
++
++  PIM_OPERATION MOp;
++  std::vector<ArgDesc> MArgs;
++
++  CGPim(PIM_OPERATION Op, std::vector<ArgDesc> Args,
++        std::vector<std::vector<char>> ArgsStorage,
++        std::vector<detail::AccessorImplPtr> AccStorage,
++        std::vector<std::shared_ptr<const void>> SharedPtrStorage,
++        std::vector<Requirement *> Requirements,
++        std::vector<detail::EventImplPtr> Events,
++        detail::code_location loc = {})
++      : CG(PIMOp, std::move(ArgsStorage), std::move(AccStorage),
++           std::move(SharedPtrStorage), std::move(Requirements),
++           std::move(Events), std::move(loc)),
++        MOp(Op), MArgs(Args) {}
++};
++
+ } // namespace detail
+ } // namespace sycl
+ } // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp b/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
+index 37a67c12f7ee..502d8f58be8d 100644
+--- a/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
++++ b/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
+@@ -9,6 +9,7 @@
+ 
+ #include <CL/sycl/access/access.hpp>
+ #include <CL/sycl/detail/accessor_impl.hpp>
++#include <CL/sycl/detail/cg.hpp>
+ #include <CL/sycl/detail/cg_types.hpp>
+ #include <CL/sycl/detail/handler_proxy.hpp>
+ #include <CL/sycl/event.hpp>
+@@ -63,42 +64,67 @@ public:
+             access_mode Op0Mode, access_mode Op1Mode>
+   void elementwise_add(pim_accessor<DataT, Dimensions, OutMode> output,
+                        pim_accessor<DataT, Dimensions, Op0Mode> operand0,
+-                       pim_accessor<DataT, Dimensions, Op1Mode> operand1);
++                       pim_accessor<DataT, Dimensions, Op1Mode> operand1) {
++    vectorOperation(output, operand0, operand1,
++                    detail::CGPim::PIM_OPERATION::ELT_VEC_ADD);
++  }
+ 
+   template <typename DataT, int Dimensions, access_mode OutMode,
+             access_mode VecMode>
+   void elementwise_add(pim_accessor<DataT, Dimensions, OutMode> output,
+                        DataT scalar,
+-                       pim_accessor<DataT, Dimensions, VecMode> vec);
++                       pim_accessor<DataT, Dimensions, VecMode> vec) {
++    scalarOperation(output, scalar, vec,
++                    detail::CGPim::PIM_OPERATION::ELT_SCALAR_ADD);
++  }
+ 
+   template <typename DataT, int Dimensions, access_mode OutMode,
+             access_mode Op0Mode, access_mode Op1Mode>
+   void elementwise_mul(pim_accessor<DataT, Dimensions, OutMode> output,
+                        pim_accessor<DataT, Dimensions, Op0Mode> operand0,
+-                       pim_accessor<DataT, Dimensions, Op1Mode> operand1);
++                       pim_accessor<DataT, Dimensions, Op1Mode> operand1) {
++    vectorOperation(output, operand0, operand1,
++                    detail::CGPim::PIM_OPERATION::ELT_VEC_MUL);
++  }
+ 
+   template <typename DataT, int Dimensions, access_mode OutMode,
+             access_mode VecMode>
+   void elementwise_mul(pim_accessor<DataT, Dimensions, OutMode> output,
+                        DataT scalar,
+-                       pim_accessor<DataT, Dimensions, VecMode> vec);
++                       pim_accessor<DataT, Dimensions, VecMode> vec) {
++    scalarOperation(output, scalar, vec,
++                    detail::CGPim::PIM_OPERATION::ELT_SCALAR_MUL);
++  }
+ 
+   template <typename DataT, int Dimensions, access_mode OutMode,
+             access_mode InMode>
+   void relu(pim_accessor<DataT, Dimensions, OutMode> output,
+-            pim_accessor<DataT, Dimensions, InMode> input);
++            pim_accessor<DataT, Dimensions, InMode> input) {
++    (void)output;
++    (void)input;
++    throw sycl::exception(errc::kernel_not_supported,
++                          "PIM operation not yet supported");
++  }
+ 
+   template <typename DataT, int OutDim, access_mode OutMode, int VecDim,
+             access_mode VecMode, int MatDim, access_mode MatMode>
+   void gemv(pim_accessor<DataT, OutDim, OutMode> output,
+             pim_accessor<DataT, VecDim, VecMode> vec,
+-            pim_accessor<DataT, MatDim, MatMode> matrix);
++            pim_accessor<DataT, MatDim, MatMode> matrix) {
++    vectorOperation(output, vec, matrix, detail::CGPim::PIM_OPERATION::GEMV);
++  }
+ 
+   template <typename DataT, int OutDim, access_mode OutMode, int VecDim,
+             access_mode VecMode, int MatDim, access_mode MatMode>
+   void gemv_add(pim_accessor<DataT, OutDim, OutMode> output,
+                 pim_accessor<DataT, VecDim, VecMode> vec,
+-                pim_accessor<DataT, MatDim, MatMode> matrix);
++                pim_accessor<DataT, MatDim, MatMode> matrix) {
++    (void)output;
++    (void)vec;
++    (void)matrix;
++    throw sycl::exception(errc::kernel_not_supported,
++                          "PIM operation not yet supported");
++  }
+ 
+   template <typename DataT, int OutDim, access_mode OutMode, int VecDim,
+             access_mode VecMode, int MatDim, access_mode MatMode, int AddDim,
+@@ -106,7 +132,15 @@ public:
+   void gemv_add(pim_accessor<DataT, OutDim, OutMode> output,
+                 pim_accessor<DataT, VecDim, VecMode> vec,
+                 pim_accessor<DataT, MatDim, MatMode> matrix,
+-                pim_accessor<DataT, AddDim, AddMode> addIn, bool fuseRelu);
++                pim_accessor<DataT, AddDim, AddMode> addIn, bool fuseRelu) {
++    (void)output;
++    (void)vec;
++    (void)matrix;
++    (void)addIn;
++    (void)fuseRelu;
++    throw sycl::exception(errc::kernel_not_supported,
++                          "PIM operation not yet supported");
++  }
+ 
+   template <typename DataT, int DataDim, access_mode OutMode,
+             access_mode InMode, int ValDim, access_mode BetaMode,
+@@ -118,7 +152,17 @@ public:
+                   pim_accessor<DataT, ValDim, GammaMode> gamma,
+                   pim_accessor<DataT, ValDim, MeanMode> mean,
+                   pim_accessor<DataT, ValDim, VarianceMode> variance,
+-                  DataT epsilon);
++                  DataT epsilon) {
++    (void)output;
++    (void)input;
++    (void)beta;
++    (void)gamma;
++    (void)mean;
++    (void)variance;
++    (void)epsilon;
++    throw sycl::exception(errc::kernel_not_supported,
++                          "PIM operation not yet supported");
++  }
+ 
+ private:
+   std::shared_ptr<detail::queue_impl> MQueue;
+@@ -127,7 +171,14 @@ private:
+   /// We need to store a copy of values that are passed explicitly through
+   /// set_arg, require and so on, because we need them to be alive after
+   /// we exit the method they are passed in.
++  std::vector<std::vector<char>> MArgsStorage;
+   std::vector<detail::AccessorImplPtr> MAccStorage;
++  std::vector<std::shared_ptr<const void>> MSharedPtrStorage;
++  /// The list of arguments for the PIM operation.
++  std::vector<detail::ArgDesc> MArgs;
++
++  /// The type of PIM operation to perform
++  detail::CGPim::PIM_OPERATION MOp = detail::CGPim::PIM_OPERATION::NOP;
+ 
+   /// The list of associated accessors with this handler.
+   /// These accessors were created with this handler as argument or
+@@ -139,6 +190,8 @@ private:
+   /// The list of events that order this operation.
+   std::vector<detail::EventImplPtr> MEvents;
+ 
++  /// Save the code location given by user submit for future usage in finalize()
++  /// method.
+   detail::code_location MCodeLoc;
+ 
+   // Make a friend to allow calling private constructors.
+@@ -150,6 +203,102 @@ private:
+ 
+   void associateWithHandler(detail::AccessorBaseHost *AccBase,
+                             access::target AccTarget);
++
++  template <typename DataT, int Dimensions, access_mode OutMode,
++            access_mode Op0Mode, access_mode Op1Mode>
++  void vectorOperation(pim_accessor<DataT, Dimensions, OutMode> output,
++                       pim_accessor<DataT, Dimensions, Op0Mode> operand0,
++                       pim_accessor<DataT, Dimensions, Op1Mode> operand1,
++                       detail::CGPim::PIM_OPERATION opCode) {
++    static_assert(std::is_same<DataT, sycl::half>::value,
++                  "PIM currently only supports FP16");
++    static_assert(isValidModeForSourceAccessor(Op0Mode),
++                  "Invalid source accessor mode");
++    static_assert(isValidModeForSourceAccessor(Op1Mode),
++                  "Invalid source accessor mode");
++    static_assert(isValidModeForDestinationAccessor(OutMode),
++                  "Invalid target accessor mode");
++    throwIfNonEmpty();
++    MOp = opCode;
++    setAccessorArgHelper(0, std::move(output));
++    setAccessorArgHelper(1, std::move(operand0));
++    setAccessorArgHelper(2, std::move(operand1));
++  }
++
++  template <typename DataT, int Dimensions, access_mode OutMode,
++            access_mode VecMode>
++  void scalarOperation(pim_accessor<DataT, Dimensions, OutMode> output,
++                       DataT scalar,
++                       pim_accessor<DataT, Dimensions, VecMode> vec,
++                       detail::CGPim::PIM_OPERATION opCode) {
++    static_assert(std::is_same<DataT, sycl::half>::value,
++                  "PIM currently only supports FP16");
++    static_assert(isValidModeForSourceAccessor(VecMode),
++                  "Invalid source accessor mode");
++    static_assert(isValidModeForDestinationAccessor(OutMode),
++                  "Invalid target accessor mode");
++    throwIfNonEmpty();
++    MOp = opCode;
++    setAccessorArgHelper(0, std::move(output));
++    setScalarArgHelper(1, scalar);
++    setAccessorArgHelper(2, std::move(vec));
++  }
++
++  void throwIfNonEmpty() {
++    if (MOp != detail::CGPim::PIM_OPERATION::NOP) {
++      throw sycl::runtime_error("Attempt to set multiple actions for the "
++                                "command group. Command group must consist "
++                                "of a single PIM operation.",
++                                CL_INVALID_OPERATION);
++    }
++  }
++
++  template <typename DataT, int DataDim, access_mode Mode>
++  void setAccessorArgHelper(int ArgIndex,
++                            pim_accessor<DataT, DataDim, Mode> &&Arg) {
++    detail::AccessorBaseHost *AccBase =
++        static_cast<detail::AccessorBaseHost *>(&Arg);
++    detail::AccessorImplPtr AccImpl = detail::getSyclObjImpl(*AccBase);
++    detail::Requirement *Req = AccImpl.get();
++    // As there are currently no placeholder pim_accessors, the accessor must
++    // have been constructed with this handler before, so there's no need to add
++    // it to MRequirements or MAccStorage.
++
++    // Add accessor to the list of arguments.
++    MArgs.emplace_back(detail::kernel_param_kind_t::kind_accessor, Req,
++                       static_cast<int>(access::target::device), ArgIndex);
++  }
++
++  /// Stores copy of Arg passed to the MArgsStorage.
++  template <typename T, typename F = typename detail::remove_const_t<
++                            typename detail::remove_reference_t<T>>>
++  F *storePlainArg(T &&Arg) {
++    MArgsStorage.emplace_back(sizeof(T));
++    auto Storage = reinterpret_cast<F *>(MArgsStorage.back().data());
++    *Storage = Arg;
++    return Storage;
++  }
++
++  template <typename T> void setScalarArgHelper(int ArgIndex, T &&Arg) {
++    static_assert(!std::is_pointer<T>::value,
++                  "Pointer arguments not supported by pim_handler");
++    auto StoredArg = static_cast<void *>(storePlainArg(Arg));
++    MArgs.emplace_back(detail::kernel_param_kind_t::kind_std_layout, StoredArg,
++                       sizeof(T), ArgIndex);
++  }
++
++  constexpr static bool isValidModeForSourceAccessor(access::mode AccessMode) {
++    return AccessMode == access::mode::read ||
++           AccessMode == access::mode::read_write;
++  }
++
++  constexpr static bool
++  isValidModeForDestinationAccessor(access::mode AccessMode) {
++    return AccessMode == access::mode::write ||
++           AccessMode == access::mode::read_write ||
++           AccessMode == access::mode::discard_write ||
++           AccessMode == access::mode::discard_read_write;
++  }
+ };
+ 
+ } // namespace samsung
+diff --git a/sycl/source/detail/config.cpp b/sycl/source/detail/config.cpp
+index 4ac9700a5e48..796bab79372f 100644
+--- a/sycl/source/detail/config.cpp
++++ b/sycl/source/detail/config.cpp
+@@ -157,13 +157,14 @@ void dumpConfig() {
+ }
+ 
+ // Array is used by SYCL_DEVICE_FILTER and SYCL_DEVICE_ALLOWLIST
+-const std::array<std::pair<std::string, info::device_type>, 5> &
++const std::array<std::pair<std::string, info::device_type>, 6> &
+ getSyclDeviceTypeMap() {
+-  static const std::array<std::pair<std::string, info::device_type>, 5>
++  static const std::array<std::pair<std::string, info::device_type>, 6>
+       SyclDeviceTypeMap = {{{"host", info::device_type::host},
+                             {"cpu", info::device_type::cpu},
+                             {"gpu", info::device_type::gpu},
+                             {"acc", info::device_type::accelerator},
++                            {"custom", info::device_type::custom},
+                             {"*", info::device_type::all}}};
+   return SyclDeviceTypeMap;
+ }
+diff --git a/sycl/source/detail/config.hpp b/sycl/source/detail/config.hpp
+index f0009e040546..2ba64885f80a 100644
+--- a/sycl/source/detail/config.hpp
++++ b/sycl/source/detail/config.hpp
+@@ -266,7 +266,7 @@ public:
+ };
+ 
+ // Array is used by SYCL_DEVICE_FILTER and SYCL_DEVICE_ALLOWLIST
+-const std::array<std::pair<std::string, info::device_type>, 5> &
++const std::array<std::pair<std::string, info::device_type>, 6> &
+ getSyclDeviceTypeMap();
+ 
+ // Array is used by SYCL_DEVICE_FILTER and SYCL_DEVICE_ALLOWLIST
+diff --git a/sycl/source/detail/scheduler/commands.cpp b/sycl/source/detail/scheduler/commands.cpp
+index 4a4846db4364..6f32df034080 100644
+--- a/sycl/source/detail/scheduler/commands.cpp
++++ b/sycl/source/detail/scheduler/commands.cpp
+@@ -2201,7 +2201,7 @@ cl_int ExecCGCommand::enqueueImp() {
+                         MCommandGroup->MRequirements.size() == 0)
+                            ? nullptr
+                            : &MEvent->getHandleRef();
+-  // TODO(Lukas, SP-17): Handle CGTYPE::PIM.
++
+   switch (MCommandGroup->getType()) {
+ 
+   case CG::CGTYPE::UpdateHost: {
+@@ -2553,6 +2553,16 @@ cl_int ExecCGCommand::enqueueImp() {
+ 
+     return PI_SUCCESS;
+   }
++  case CG::CGTYPE::PIMOp: {
++    auto *ExecPim = static_cast<CGPim *>(MCommandGroup.get());
++
++    auto getMemAllocationFunc = [this](Requirement *Req) {
++      AllocaCommandBase *AllocaCmd = getAllocaForReq(Req);
++      return AllocaCmd->getMemAllocation();
++    };
++    return LaunchPimOperation(MQueue, ExecPim->MArgs, ExecPim->MOp, RawEvents,
++                              &MEvent->getHandleRef(), getMemAllocationFunc);
++  }
+   case CG::CGTYPE::None:
+     throw runtime_error("CG type not implemented.", PI_INVALID_OPERATION);
+   }
+@@ -2574,6 +2584,103 @@ bool ExecCGCommand::supportsPostEnqueueCleanup() const {
+                 ->hasAuxiliaryResources()));
+ }
+ 
++pi_result ExecCGCommand::LaunchPimOperation(
++    const QueueImplPtr &Queue, std::vector<ArgDesc> &Args,
++    CGPim::PIM_OPERATION Op, std::vector<RT::PiEvent> &RawEvents,
++    RT::PiEvent *OutEvent,
++    const std::function<void *(Requirement *Req)> &getMemAllocationFunc) {
++  if (Op == CGPim::PIM_OPERATION::NOP) {
++    // Nothing to launch in case of NOP.
++    return PI_SUCCESS;
++  }
++
++  const detail::plugin &Plugin = Queue->getPlugin();
++  assert(Plugin.getBackend() == backend::hip &&
++         "PIM operations only supported on HIP backend");
++
++  auto ContextImpl = Queue->getContextImplPtr();
++  RT::PiProgram DummyProgram = nullptr;
++  Plugin.call<PiApiKind::piProgramCreate>(ContextImpl->getHandleRef(), nullptr,
++                                          0, &DummyProgram);
++
++  auto KernelIdentifier = translatePimOpType(Op);
++  if (KernelIdentifier.empty()) {
++    return PI_INVALID_OPERATION;
++  }
++
++  RT::PiKernel OpKernel = nullptr;
++  Plugin.call<detail::PiApiKind::piKernelCreate>(
++      DummyProgram, KernelIdentifier.c_str(), &OpKernel);
++
++  auto setFunc = [&Plugin, OpKernel,
++                  &getMemAllocationFunc](detail::ArgDesc &Arg) {
++    switch (Arg.MType) {
++    case kernel_param_kind_t::kind_accessor: {
++      auto *Req = static_cast<Requirement *>(Arg.MPtr);
++      assert(getMemAllocationFunc != nullptr && "The function should not "
++                                                "be nullptr as we "
++                                                "followed the path for "
++                                                "which accessors are "
++                                                "used");
++      RT::PiMem MemArg = static_cast<RT::PiMem>(getMemAllocationFunc(Req));
++      Plugin.call<PiApiKind::piextKernelSetArgMemObj>(OpKernel, Arg.MIndex,
++                                                      &MemArg);
++      break;
++    }
++    case kernel_param_kind_t::kind_std_layout: {
++      // The PIM SDK does not take scalar arguments by value, but by pointer, so
++      // we need to pass pointer-to-pointer to the PI. The command and
++      // command-group should outlast the execution of the command, to it is
++      // safe to use the pointer into the command argument storage here.
++      auto size = sizeof(Arg.MPtr);
++      void **ptr = &Arg.MPtr;
++      Plugin.call<PiApiKind::piKernelSetArg>(OpKernel, Arg.MIndex, size, ptr);
++      break;
++    }
++    case kernel_param_kind_t::kind_invalid:
++      throw runtime_error("Invalid kernel param kind", PI_INVALID_VALUE);
++      break;
++    default:
++      throw runtime_error("Argument type not supported by PIM",
++                          PI_INVALID_VALUE);
++      break;
++    }
++  };
++
++  for (auto &Arg : Args) {
++    setFunc(Arg);
++  }
++
++  pi_result Error =
++      Plugin.call_nocheck<detail::PiApiKind::piEnqueueKernelLaunch>(
++          Queue->getHandleRef(), OpKernel, 0, nullptr, nullptr, nullptr,
++          RawEvents.size(), RawEvents.empty() ? nullptr : &RawEvents[0],
++          OutEvent);
++
++  // Because the kernels here are just container for arguments, it's safe to
++  // release the kernel created above here.
++  Plugin.call<detail::PiApiKind::piKernelRelease>(OpKernel);
++  return Error;
++}
++
++std::string ExecCGCommand::translatePimOpType(CGPim::PIM_OPERATION Op) {
++  switch (Op) {
++  case CGPim::PIM_OPERATION::ELT_VEC_ADD:
++    return PI_PIM_VEC_ADD_OP;
++  case CGPim::PIM_OPERATION::ELT_SCALAR_ADD:
++    return PI_PIM_SCALAR_ADD_OP;
++  case CGPim::PIM_OPERATION::ELT_VEC_MUL:
++    return PI_PIM_VEC_MUL_OP;
++  case CGPim::PIM_OPERATION::ELT_SCALAR_MUL:
++    return PI_PIM_SCALAR_MUL_OP;
++  case CGPim::PIM_OPERATION::GEMV:
++    return PI_PIM_GEMV_OP;
++  case CGPim::PIM_OPERATION::NOP:
++  default:
++    return "";
++  }
++}
++
+ } // namespace detail
+ } // namespace sycl
+ } // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/source/detail/scheduler/commands.hpp b/sycl/source/detail/scheduler/commands.hpp
+index 75b2ae82ed3e..ded6cacabf23 100644
+--- a/sycl/source/detail/scheduler/commands.hpp
++++ b/sycl/source/detail/scheduler/commands.hpp
+@@ -566,6 +566,14 @@ private:
+ 
+   AllocaCommandBase *getAllocaForReq(Requirement *Req);
+ 
++  pi_result LaunchPimOperation(
++      const QueueImplPtr &Queue, std::vector<ArgDesc> &Args,
++      CGPim::PIM_OPERATION Op, std::vector<RT::PiEvent> &RawEvents,
++      RT::PiEvent *OutEvent,
++      const std::function<void *(Requirement *Req)> &getMemAllocationFunc);
++
++  std::string translatePimOpType(CGPim::PIM_OPERATION Op);
++
+   std::unique_ptr<detail::CG> MCommandGroup;
+ 
+   friend class Command;
+diff --git a/sycl/source/pim_handler.cpp b/sycl/source/pim_handler.cpp
+index f14c3643da6c..57ab32dc13f1 100644
+--- a/sycl/source/pim_handler.cpp
++++ b/sycl/source/pim_handler.cpp
+@@ -7,7 +7,9 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include <CL/sycl/detail/accessor_impl.hpp>
++#include <CL/sycl/detail/cg.hpp>
+ #include <detail/event_impl.hpp>
++#include <detail/scheduler/scheduler.hpp>
+ #include <sycl/ext/samsung/pim/pim_handler.hpp>
+ 
+ __SYCL_INLINE_NAMESPACE(cl) {
+@@ -40,18 +42,28 @@ void pim_handler::depends_on(const std::vector<event> &Events) {
+ }
+ 
+ event pim_handler::finalize() {
+-  // TODO(Lukas, SP-17) The regular handler defines a short-cut for cases where
+-  // no dependencies are added to the graph (MRequirements.size() +
+-  // MEvents.size() + MStreamStorage.size() == 0). In those cases, the kernel is
+-  // launched immediately. We could potentially do something similar here.
++  // The regular handler defines a short-cut for cases where no dependencies are
++  // added to the graph (MRequirements.size() + MEvents.size() +
++  // MStreamStorage.size() == 0). In those cases, the kernel is launched
++  // immediately. Given that at the time of writing each PIM operation (member
++  // function of pim_handler) takes at least one pim_accessor as arguments, it
++  // seems unlikely that MRequirements can ever be empty and the shortcut could
++  // be applied.
+ 
+-  // TODO(Lukas, SP-17): Construct an actual command to be executed by the
+-  // scheduler.
++  auto CommandGroup = std::make_unique<detail::CGPim>(
++      MOp, std::move(MArgs), std::move(MArgsStorage), std::move(MAccStorage),
++      std::move(MSharedPtrStorage), std::move(MRequirements),
++      std::move(MEvents), std::move(MCodeLoc));
+ 
+-  if (detail::pi::trace(detail::pi::TraceLevel::PI_TRACE_ALL)) {
+-    std::cout << "WARNING: PIM operations not yet implemented." << std::endl;
++  if (!CommandGroup) {
++    throw sycl::runtime_error(
++        "Internal Error. Command group cannot be constructed.",
++        PI_INVALID_OPERATION);
+   }
+-  detail::EventImplPtr Event = std::make_shared<cl::sycl::detail::event_impl>();
++
++  detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(
++      std::move(CommandGroup), std::move(MQueue));
++
+   return detail::createSyclObjFromImpl<event>(Event);
+ }
+ 
+diff --git a/sycl/unittests/allowlist/ParseAllowList.cpp b/sycl/unittests/allowlist/ParseAllowList.cpp
+index 0d2a8edb91ba..95f4104a4af1 100644
+--- a/sycl/unittests/allowlist/ParseAllowList.cpp
++++ b/sycl/unittests/allowlist/ParseAllowList.cpp
+@@ -185,6 +185,7 @@ TEST(ParseAllowListTests, CheckAllValidDeviceTypeValuesAreProcessed) {
+                                                {{"DeviceType", "cpu"}},
+                                                {{"DeviceType", "gpu"}},
+                                                {{"DeviceType", "acc"}},
++                                               {{"DeviceType", "custom"}},
+                                                {{"DeviceType", "*"}}};
+   EXPECT_EQ(ExpectedValue, ActualValue);
+ }
+-- 
+2.17.1
+

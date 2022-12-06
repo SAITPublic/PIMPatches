@@ -1,0 +1,671 @@
+From 2b4c475b7e8d46d3d89f90f4723e236012683c46 Mon Sep 17 00:00:00 2001
+From: Lukas Sommer <lukas.sommer@codeplay.com>
+Date: Mon, 20 Jun 2022 08:19:03 +0000
+Subject: [PATCH 05/17] [SYCL][PIM] Implementation of pim_accessor;
+
+The `pim_accessor` makes buffers available for PIM operations
+on the device and also sets up requirements on the buffer to
+integrate PIM operations into dependency tracking.
+---
+ sycl/include/CL/sycl.hpp                      |   1 +
+ sycl/include/CL/sycl/accessor.hpp             |  39 +--
+ sycl/include/CL/sycl/buffer.hpp               |  11 +-
+ sycl/include/CL/sycl/detail/accessor_impl.hpp |  17 ++
+ sycl/include/CL/sycl/detail/handler_proxy.hpp |  16 +
+ .../sycl/ext/samsung/pim/pim_accessor.hpp     | 277 ++++++++++++++++++
+ .../sycl/ext/samsung/pim/pim_handler.hpp      |  23 ++
+ sycl/source/detail/handler_proxy.cpp          |  10 +
+ sycl/source/pim_handler.cpp                   |  16 +
+ 9 files changed, 381 insertions(+), 29 deletions(-)
+ create mode 100644 sycl/include/sycl/ext/samsung/pim/pim_accessor.hpp
+
+diff --git a/sycl/include/CL/sycl.hpp b/sycl/include/CL/sycl.hpp
+index ca5a0e040ce6..07552f66c24f 100644
+--- a/sycl/include/CL/sycl.hpp
++++ b/sycl/include/CL/sycl.hpp
+@@ -73,4 +73,5 @@
+ #include <sycl/ext/oneapi/sub_group_mask.hpp>
+ #if SYCL_EXT_SAMSUNG_PIM
+ #include <sycl/ext/samsung/pim/pim_handler.hpp>
++#include <sycl/ext/samsung/pim/pim_accessor.hpp>
+ #endif
+diff --git a/sycl/include/CL/sycl/accessor.hpp b/sycl/include/CL/sycl/accessor.hpp
+index 26a1624c56d4..2de078a38714 100644
+--- a/sycl/include/CL/sycl/accessor.hpp
++++ b/sycl/include/CL/sycl/accessor.hpp
+@@ -858,21 +858,6 @@ protected:
+     return std::is_same<T, DataT>::value && (Dims > 0) && (Dims == Dimensions);
+   }
+ 
+-  static access::mode getAdjustedMode(const PropertyListT &PropertyList) {
+-    access::mode AdjustedMode = AccessMode;
+-
+-    if (PropertyList.template has_property<property::no_init>() ||
+-        PropertyList.template has_property<property::noinit>()) {
+-      if (AdjustedMode == access::mode::write) {
+-        AdjustedMode = access::mode::discard_write;
+-      } else if (AdjustedMode == access::mode::read_write) {
+-        AdjustedMode = access::mode::discard_read_write;
+-      }
+-    }
+-
+-    return AdjustedMode;
+-  }
+-
+ #if __cplusplus >= 201703L
+ 
+   template <typename TagT> static constexpr bool IsValidTag() {
+@@ -1016,7 +1001,7 @@ public:
+       : AccessorBaseHost(
+             /*Offset=*/{0, 0, 0}, detail::convertToArrayOfN<3, 1>(range<1>{1}),
+             detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+-            getAdjustedMode(PropertyList),
++            getAdjustedMode<AccessMode>(PropertyList),
+             detail::getSyclObjImpl(BufferRef).get(), AdjustedDim, sizeof(DataT),
+             BufferRef.OffsetInBytes, BufferRef.IsSubBuffer) {
+     preScreenAccessor(BufferRef.size(), PropertyList);
+@@ -1047,7 +1032,7 @@ public:
+       : AccessorBaseHost(
+             /*Offset=*/{0, 0, 0}, detail::convertToArrayOfN<3, 1>(range<1>{1}),
+             detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+-            getAdjustedMode(PropertyList),
++            getAdjustedMode<AccessMode>(PropertyList),
+             detail::getSyclObjImpl(BufferRef).get(), AdjustedDim, sizeof(DataT),
+             BufferRef.OffsetInBytes, BufferRef.IsSubBuffer) {
+     preScreenAccessor(BufferRef.size(), PropertyList);
+@@ -1077,7 +1062,7 @@ public:
+       : AccessorBaseHost(
+             /*Offset=*/{0, 0, 0}, detail::convertToArrayOfN<3, 1>(range<1>{1}),
+             detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+-            getAdjustedMode(PropertyList),
++            getAdjustedMode<AccessMode>(PropertyList),
+             detail::getSyclObjImpl(BufferRef).get(), Dimensions, sizeof(DataT),
+             BufferRef.OffsetInBytes, BufferRef.IsSubBuffer) {
+     preScreenAccessor(BufferRef.size(), PropertyList);
+@@ -1108,7 +1093,7 @@ public:
+       : AccessorBaseHost(
+             /*Offset=*/{0, 0, 0}, detail::convertToArrayOfN<3, 1>(range<1>{1}),
+             detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+-            getAdjustedMode(PropertyList),
++            getAdjustedMode<AccessMode>(PropertyList),
+             detail::getSyclObjImpl(BufferRef).get(), Dimensions, sizeof(DataT),
+             BufferRef.OffsetInBytes, BufferRef.IsSubBuffer) {
+     preScreenAccessor(BufferRef.size(), PropertyList);
+@@ -1138,7 +1123,7 @@ public:
+             /*Offset=*/{0, 0, 0},
+             detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+             detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+-            getAdjustedMode(PropertyList),
++            getAdjustedMode<AccessMode>(PropertyList),
+             detail::getSyclObjImpl(BufferRef).get(), Dimensions, sizeof(DataT),
+             BufferRef.OffsetInBytes, BufferRef.IsSubBuffer) {
+     preScreenAccessor(BufferRef.size(), PropertyList);
+@@ -1171,7 +1156,7 @@ public:
+             /*Offset=*/{0, 0, 0},
+             detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+             detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+-            getAdjustedMode(PropertyList),
++            getAdjustedMode<AccessMode>(PropertyList),
+             detail::getSyclObjImpl(BufferRef).get(), Dimensions, sizeof(DataT),
+             BufferRef.OffsetInBytes, BufferRef.IsSubBuffer) {
+     preScreenAccessor(BufferRef.size(), PropertyList);
+@@ -1234,7 +1219,7 @@ public:
+             /*Offset=*/{0, 0, 0},
+             detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+             detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+-            getAdjustedMode(PropertyList),
++            getAdjustedMode<AccessMode>(PropertyList),
+             detail::getSyclObjImpl(BufferRef).get(), Dimensions, sizeof(DataT),
+             BufferRef.OffsetInBytes, BufferRef.IsSubBuffer) {
+     preScreenAccessor(BufferRef.size(), PropertyList);
+@@ -1266,7 +1251,7 @@ public:
+             /*Offset=*/{0, 0, 0},
+             detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+             detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+-            getAdjustedMode(PropertyList),
++            getAdjustedMode<AccessMode>(PropertyList),
+             detail::getSyclObjImpl(BufferRef).get(), Dimensions, sizeof(DataT),
+             BufferRef.OffsetInBytes, BufferRef.IsSubBuffer) {
+     preScreenAccessor(BufferRef.size(), PropertyList);
+@@ -1451,7 +1436,7 @@ public:
+       : AccessorBaseHost(detail::convertToArrayOfN<3, 0>(AccessOffset),
+                          detail::convertToArrayOfN<3, 1>(AccessRange),
+                          detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+-                         getAdjustedMode(PropertyList),
++                         getAdjustedMode<AccessMode>(PropertyList),
+                          detail::getSyclObjImpl(BufferRef).get(), Dimensions,
+                          sizeof(DataT), BufferRef.OffsetInBytes,
+                          BufferRef.IsSubBuffer) {
+@@ -1492,7 +1477,7 @@ public:
+       : AccessorBaseHost(detail::convertToArrayOfN<3, 0>(AccessOffset),
+                          detail::convertToArrayOfN<3, 1>(AccessRange),
+                          detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+-                         getAdjustedMode(PropertyList),
++                         getAdjustedMode<AccessMode>(PropertyList),
+                          detail::getSyclObjImpl(BufferRef).get(), Dimensions,
+                          sizeof(DataT), BufferRef.OffsetInBytes,
+                          BufferRef.IsSubBuffer) {
+@@ -1564,7 +1549,7 @@ public:
+       : AccessorBaseHost(detail::convertToArrayOfN<3, 0>(AccessOffset),
+                          detail::convertToArrayOfN<3, 1>(AccessRange),
+                          detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+-                         getAdjustedMode(PropertyList),
++                         getAdjustedMode<AccessMode>(PropertyList),
+                          detail::getSyclObjImpl(BufferRef).get(), Dimensions,
+                          sizeof(DataT), BufferRef.OffsetInBytes,
+                          BufferRef.IsSubBuffer) {
+@@ -1604,7 +1589,7 @@ public:
+       : AccessorBaseHost(detail::convertToArrayOfN<3, 0>(AccessOffset),
+                          detail::convertToArrayOfN<3, 1>(AccessRange),
+                          detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+-                         getAdjustedMode(PropertyList),
++                         getAdjustedMode<AccessMode>(PropertyList),
+                          detail::getSyclObjImpl(BufferRef).get(), Dimensions,
+                          sizeof(DataT), BufferRef.OffsetInBytes,
+                          BufferRef.IsSubBuffer) {
+diff --git a/sycl/include/CL/sycl/buffer.hpp b/sycl/include/CL/sycl/buffer.hpp
+index 249a28c6995e..ebab3233ec99 100644
+--- a/sycl/include/CL/sycl/buffer.hpp
++++ b/sycl/include/CL/sycl/buffer.hpp
+@@ -23,6 +23,12 @@ class handler;
+ class queue;
+ template <int dimensions> class range;
+ 
++namespace ext {
++namespace samsung {
++template <typename, int, access_mode> class pim_accessor;
++} // namespace samsung
++} // namespace ext
++
+ namespace detail {
+ template <typename T, int Dimensions, typename AllocatorT>
+ buffer<T, Dimensions, AllocatorT, void>
+@@ -62,8 +68,8 @@ public:
+   template <class Container>
+   using EnableIfContiguous =
+       detail::void_t<detail::enable_if_t<std::is_convertible<
+-                         detail::remove_pointer_t<
+-                             decltype(std::declval<Container>().data())> (*)[],
++                         detail::remove_pointer_t<decltype(
++                             std::declval<Container>().data())> (*)[],
+                          const T (*)[]>::value>,
+                      decltype(std::declval<Container>().size())>;
+   template <class It>
+@@ -528,6 +534,7 @@ private:
+   template <typename DataT, int dims, access::mode mode, access::target target,
+             access::placeholder isPlaceholder, typename PropertyListT>
+   friend class accessor;
++  template <typename, int, access_mode> friend class ext::samsung::pim_accessor;
+   template <typename HT, int HDims, typename HAllocT>
+   friend buffer<HT, HDims, HAllocT, void>
+   detail::make_buffer_helper(pi_native_handle, const context &, event, bool);
+diff --git a/sycl/include/CL/sycl/detail/accessor_impl.hpp b/sycl/include/CL/sycl/detail/accessor_impl.hpp
+index ae7f9168f2c0..e46819d7f305 100644
+--- a/sycl/include/CL/sycl/detail/accessor_impl.hpp
++++ b/sycl/include/CL/sycl/detail/accessor_impl.hpp
+@@ -12,6 +12,7 @@
+ #include <CL/sycl/detail/export.hpp>
+ #include <CL/sycl/detail/sycl_mem_obj_i.hpp>
+ #include <CL/sycl/id.hpp>
++#include <CL/sycl/properties/accessor_properties.hpp>
+ #include <CL/sycl/range.hpp>
+ #include <CL/sycl/stl.hpp>
+ 
+@@ -159,6 +160,22 @@ protected:
+             typename>
+   friend class accessor;
+ 
++  template <access_mode AccessMode, typename PropertyListT>
++  static access::mode getAdjustedMode(const PropertyListT &PropertyList) {
++    access::mode AdjustedMode = AccessMode;
++
++    if (PropertyList.template has_property<property::no_init>() ||
++        PropertyList.template has_property<property::noinit>()) {
++      if (AdjustedMode == access::mode::write) {
++        AdjustedMode = access::mode::discard_write;
++      } else if (AdjustedMode == access::mode::read_write) {
++        AdjustedMode = access::mode::discard_read_write;
++      }
++    }
++
++    return AdjustedMode;
++  }
++
+   AccessorImplPtr impl;
+ 
+ private:
+diff --git a/sycl/include/CL/sycl/detail/handler_proxy.hpp b/sycl/include/CL/sycl/detail/handler_proxy.hpp
+index 8ed01eb7a7b4..90f2756aa2f4 100644
+--- a/sycl/include/CL/sycl/detail/handler_proxy.hpp
++++ b/sycl/include/CL/sycl/detail/handler_proxy.hpp
+@@ -10,18 +10,34 @@
+ 
+ #include <CL/sycl/access/access.hpp>
+ #include <CL/sycl/detail/export.hpp>
++#include <CL/sycl/feature_test.hpp>
+ 
+ __SYCL_INLINE_NAMESPACE(cl) {
+ namespace sycl {
+ 
+ class handler;
+ 
++#if SYCL_EXT_SAMSUNG_PIM
++namespace ext {
++namespace samsung {
++class pim_handler;
++} // namespace samsung
++} // namespace ext
++#endif // SYCL_EXT_SAMSUNG_PIM
++
+ namespace detail {
+ 
+ class AccessorBaseHost;
+ 
+ __SYCL_EXPORT void associateWithHandler(handler &, AccessorBaseHost *,
+                                         access::target);
++
++#if SYCL_EXT_SAMSUNG_PIM
++__SYCL_EXPORT void associateWithPIMHandler(ext::samsung::pim_handler &PH,
++                                           AccessorBaseHost *Acc,
++                                           access::target Target);
++#endif // SYCL_EXT_SAMSUNG_PIM
++
+ } // namespace detail
+ } // namespace sycl
+ } // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/include/sycl/ext/samsung/pim/pim_accessor.hpp b/sycl/include/sycl/ext/samsung/pim/pim_accessor.hpp
+new file mode 100644
+index 000000000000..64ebf5e36e51
+--- /dev/null
++++ b/sycl/include/sycl/ext/samsung/pim/pim_accessor.hpp
+@@ -0,0 +1,277 @@
++//==-------- pim_accessor.hpp --- SYCL PIM accessor for commands -----------==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++#pragma once
++
++#include <CL/sycl/access/access.hpp>
++#include <CL/sycl/accessor.hpp>
++#include <CL/sycl/buffer.hpp>
++#include <CL/sycl/detail/accessor_impl.hpp>
++#include <sycl/ext/samsung/pim/pim_handler.hpp>
++
++__SYCL_INLINE_NAMESPACE(cl) {
++namespace sycl {
++namespace ext {
++namespace samsung {
++enum class pim_mem_flag {
++  unspecified,
++  elementwise_op,
++  gemv_input,
++  gemv_weight,
++  gemv_output,
++  gemv_weight_t
++};
++
++enum class pim_op_type {
++  unspecified,
++  gemv,
++  elt_add,
++  elt_mul,
++  relu,
++  batch_norm,
++  copy
++};
++
++template <typename DataT, int Dimensions = 1,
++          access_mode AccessMode =
++              (std::is_const<DataT>::value ? access_mode::read
++                                           : access_mode::read_write)>
++class pim_accessor : public detail::AccessorBaseHost {
++
++  static_assert(std::is_same<DataT, sycl::half>::value,
++                "pim_accessor currently only supports half-float data type");
++
++private:
++  // Non-templated, modified copy of the corresponding method in accessor.hpp.
++  void preScreenAccessor(const size_t elemInBuffer,
++                         const property_list &PropertyList) {
++    // check device accessor buffer size
++    if (elemInBuffer == 0) {
++      throw sycl::exception(
++          sycl::errc::invalid,
++          "SYCL buffer size is zero. To create a PIM accessor, SYCL "
++          "buffer size must be greater than zero.");
++    }
++
++    // check that no_init property is compatible with access mode
++    if (PropertyList.template has_property<property::no_init>() &&
++        AccessMode == access::mode::read) {
++      throw sycl::exception(sycl::errc::invalid,
++                            "accessor cannot be both read_only and no_init");
++    }
++  }
++
++#if __cplusplus >= 201703L
++
++  template <typename TagT> static constexpr bool IsValidTag() {
++    return std::is_same_v<TagT, mode_tag_t<AccessMode>>;
++  }
++
++#endif
++
++public:
++  using size_type = size_t;
++
++  template <typename AllocatorT>
++  pim_accessor(
++      buffer<DataT, Dimensions, AllocatorT> &BufferRef,
++      pim_handler &PimHandlerRef,
++      pim_mem_flag MemFlag = pim_mem_flag::unspecified,
++      pim_op_type OpType = pim_op_type::unspecified,
++      const property_list &PropList = {},
++      const detail::code_location CodeLoc = detail::code_location::current())
++      : AccessorBaseHost(
++            /*Offset=*/{0, 0, 0},
++            ::sycl::detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
++            ::sycl::detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
++            getAdjustedMode<AccessMode>(PropList),
++            detail::getSyclObjImpl(BufferRef).get(), Dimensions, sizeof(DataT),
++            BufferRef.OffsetInBytes, BufferRef.IsSubBuffer) {
++    preScreenAccessor(BufferRef.size(), PropList);
++    detail::associateWithPIMHandler(PimHandlerRef, this,
++                                    access::target::device);
++    // TODO(Lukas, SP-21): Handle MemFlag and OpType
++    (void)MemFlag;
++    (void)OpType;
++    detail::constructorNotification(detail::getSyclObjImpl(BufferRef).get(),
++                                    detail::AccessorBaseHost::impl.get(),
++                                    access::target::device, AccessMode,
++                                    CodeLoc);
++  }
++
++  template <typename AllocatorT>
++  pim_accessor(
++      buffer<DataT, Dimensions, AllocatorT> &BufferRef,
++      pim_handler &PimHandlerRef, range<Dimensions> AccessRange,
++      pim_mem_flag MemFlag = pim_mem_flag::unspecified,
++      pim_op_type OpType = pim_op_type::unspecified,
++      const property_list &PropList = {},
++      const detail::code_location CodeLoc = detail::code_location::current())
++      : pim_accessor(BufferRef, PimHandlerRef, AccessRange, {}, MemFlag, OpType,
++                     PropList) {}
++
++  template <typename AllocatorT>
++  pim_accessor(
++      buffer<DataT, Dimensions, AllocatorT> &BufferRef,
++      pim_handler &PimHandlerRef, range<Dimensions> AccessRange,
++      id<Dimensions> AccessOffset,
++      pim_mem_flag MemFlag = pim_mem_flag::unspecified,
++      pim_op_type OpType = pim_op_type::unspecified,
++      const property_list &PropList = {},
++      const detail::code_location CodeLoc = detail::code_location::current())
++      : AccessorBaseHost(
++            ::sycl::detail::convertToArrayOfN<3, 1>(AccessOffset),
++            ::sycl::detail::convertToArrayOfN<3, 1>(AccessRange),
++            ::sycl::detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
++            getAdjustedMode<AccessMode>(PropList),
++            detail::getSyclObjImpl(BufferRef).get(), Dimensions, sizeof(DataT),
++            BufferRef.OffsetInBytes, BufferRef.IsSubBuffer) {
++    preScreenAccessor(BufferRef.size(), PropList);
++    if (BufferRef.isOutOfBounds(AccessOffset, AccessRange,
++                                BufferRef.get_range())) {
++      throw sycl::exception(sycl::errc::invalid,
++                            "pim_accessor with requested offset and "
++                            "range would exceed the bounds of the buffer");
++    }
++    detail::associateWithPIMHandler(PimHandlerRef, this,
++                                    access::target::device);
++    // TODO(Lukas, SP-21): Handle MemFlag and OpType
++    (void)MemFlag;
++    (void)OpType;
++    detail::constructorNotification(detail::getSyclObjImpl(BufferRef).get(),
++                                    detail::AccessorBaseHost::impl.get(),
++                                    access::target::device, AccessMode,
++                                    CodeLoc);
++  }
++
++#if __cplusplus >= 201703L
++  template <typename AllocatorT, typename TagT,
++            std::enable_if_t<IsValidTag<TagT>(), bool> = true>
++  pim_accessor(
++      buffer<DataT, Dimensions, AllocatorT> &BufferRef,
++      pim_handler &PimHandlerRef, TagT,
++      pim_mem_flag MemFlag = pim_mem_flag::unspecified,
++      pim_op_type OpType = pim_op_type::unspecified,
++      const property_list &PropList = {},
++      const detail::code_location CodeLoc = detail::code_location::current())
++      : pim_accessor(BufferRef, PimHandlerRef, MemFlag, OpType, PropList,
++                     CodeLoc) {}
++
++  template <typename AllocatorT, typename TagT,
++            std::enable_if_t<IsValidTag<TagT>(), bool> = true>
++  pim_accessor(
++      buffer<DataT, Dimensions, AllocatorT> &BufferRef,
++      pim_handler &PimHandlerRef, range<Dimensions> AccessRange, TagT,
++      pim_mem_flag MemFlag = pim_mem_flag::unspecified,
++      pim_op_type OpType = pim_op_type::unspecified,
++      const property_list &PropList = {},
++      const detail::code_location CodeLoc = detail::code_location::current())
++      : pim_accessor(BufferRef, PimHandlerRef, AccessRange, MemFlag, OpType,
++                     PropList, CodeLoc) {}
++
++  template <typename AllocatorT, typename TagT,
++            std::enable_if_t<IsValidTag<TagT>(), bool> = true>
++  pim_accessor(
++      buffer<DataT, Dimensions, AllocatorT> &BufferRef,
++      pim_handler &PimHandlerRef, range<Dimensions> AccessRange,
++      id<Dimensions> AccessOffset, TagT,
++      pim_mem_flag MemFlag = pim_mem_flag::unspecified,
++      pim_op_type OpType = pim_op_type::unspecified,
++      const property_list &PropList = {},
++      const detail::code_location CodeLoc = detail::code_location::current())
++      : pim_accessor(BufferRef, PimHandlerRef, AccessRange, AccessOffset,
++                     MemFlag, OpType, PropList, CodeLoc) {}
++#endif
++
++  size_type byte_size() const noexcept { return size() * getElemSize(); }
++
++  size_type size() const noexcept { return getAccessRange().size(); }
++
++  size_type max_size() const noexcept {
++    return std::numeric_limits<DataT *>::max();
++  }
++
++  bool empty() const noexcept { return size() == 0; };
++
++  /* Available only when: (Dimensions > 0) */
++  range<Dimensions> get_range() const {
++    return ::sycl::detail::convertToArrayOfN<Dimensions, 1>(getAccessRange());
++  }
++
++  /* Available only when: (Dimensions > 0) */
++  id<Dimensions> get_offset() const {
++    return ::sycl::detail::convertToArrayOfN<Dimensions, 1>(getOffset());
++  }
++};
++
++#if __cplusplus >= 201703L
++
++// Deduction guides for the constructors taking a tag to specify an access mode.
++template <typename DataT, int Dim, typename AllocatorT, typename Type1>
++pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, Type1,
++             pim_mem_flag, pim_op_type, const property_list &)
++    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
++
++template <typename DataT, int Dim, typename AllocatorT, typename Type1>
++pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, Type1,
++             pim_mem_flag, pim_op_type)
++    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
++
++template <typename DataT, int Dim, typename AllocatorT, typename Type1>
++pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, Type1,
++             pim_mem_flag)
++    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
++
++template <typename DataT, int Dim, typename AllocatorT, typename Type1>
++pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, Type1)
++    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
++
++template <typename DataT, int Dim, typename AllocatorT, typename Type1>
++pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>, Type1,
++             pim_mem_flag, pim_op_type, const property_list &)
++    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
++
++template <typename DataT, int Dim, typename AllocatorT, typename Type1>
++pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>, Type1,
++             pim_mem_flag, pim_op_type)
++    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
++
++template <typename DataT, int Dim, typename AllocatorT, typename Type1>
++pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>, Type1,
++             pim_mem_flag)
++    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
++
++template <typename DataT, int Dim, typename AllocatorT, typename Type1>
++pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>, Type1)
++    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
++
++template <typename DataT, int Dim, typename AllocatorT, typename Type1>
++pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>,
++             id<Dim>, Type1, pim_mem_flag, pim_op_type, const property_list &)
++    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
++
++template <typename DataT, int Dim, typename AllocatorT, typename Type1>
++pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>,
++             id<Dim>, Type1, pim_mem_flag, pim_op_type)
++    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
++
++template <typename DataT, int Dim, typename AllocatorT, typename Type1>
++pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>,
++             id<Dim>, Type1, pim_mem_flag)
++    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
++
++template <typename DataT, int Dim, typename AllocatorT, typename Type1>
++pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>,
++             id<Dim>, Type1)
++    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
++
++#endif
++
++} // namespace samsung
++} // namespace ext
++} // namespace sycl
++} // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp b/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
+index a06283062ed7..37a67c12f7ee 100644
+--- a/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
++++ b/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
+@@ -8,6 +8,9 @@
+ #pragma once
+ 
+ #include <CL/sycl/access/access.hpp>
++#include <CL/sycl/detail/accessor_impl.hpp>
++#include <CL/sycl/detail/cg_types.hpp>
++#include <CL/sycl/detail/handler_proxy.hpp>
+ #include <CL/sycl/event.hpp>
+ 
+ __SYCL_INLINE_NAMESPACE(cl) {
+@@ -120,6 +123,19 @@ public:
+ private:
+   std::shared_ptr<detail::queue_impl> MQueue;
+ 
++  /// The storage for the arguments passed.
++  /// We need to store a copy of values that are passed explicitly through
++  /// set_arg, require and so on, because we need them to be alive after
++  /// we exit the method they are passed in.
++  std::vector<detail::AccessorImplPtr> MAccStorage;
++
++  /// The list of associated accessors with this handler.
++  /// These accessors were created with this handler as argument or
++  /// have become required for this handler via require method.
++  std::vector<detail::ArgDesc> MAssociatedAccessors;
++  /// The list of requirements to the memory objects for the scheduling.
++  std::vector<detail::Requirement *> MRequirements;
++
+   /// The list of events that order this operation.
+   std::vector<detail::EventImplPtr> MEvents;
+ 
+@@ -127,6 +143,13 @@ private:
+ 
+   // Make a friend to allow calling private constructors.
+   friend detail::queue_impl;
++
++  friend void detail::associateWithPIMHandler(ext::samsung::pim_handler &,
++                                              detail::AccessorBaseHost *,
++                                              access::target);
++
++  void associateWithHandler(detail::AccessorBaseHost *AccBase,
++                            access::target AccTarget);
+ };
+ 
+ } // namespace samsung
+diff --git a/sycl/source/detail/handler_proxy.cpp b/sycl/source/detail/handler_proxy.cpp
+index c294634763b7..5e3a544ec2c6 100644
+--- a/sycl/source/detail/handler_proxy.cpp
++++ b/sycl/source/detail/handler_proxy.cpp
+@@ -9,6 +9,9 @@
+ #include <CL/sycl/detail/handler_proxy.hpp>
+ 
+ #include <CL/sycl/handler.hpp>
++#if SYCL_EXT_SAMSUNG_PIM
++#include <sycl/ext/samsung/pim/pim_handler.hpp>
++#endif // SYCL_EXT_SAMSUNG_PIM
+ 
+ __SYCL_INLINE_NAMESPACE(cl) {
+ namespace sycl {
+@@ -19,6 +22,13 @@ void associateWithHandler(handler &CGH, AccessorBaseHost *Acc,
+   CGH.associateWithHandler(Acc, Target);
+ }
+ 
++#if SYCL_EXT_SAMSUNG_PIM
++void associateWithPIMHandler(ext::samsung::pim_handler &PH,
++                             AccessorBaseHost *Acc, access::target Target) {
++  PH.associateWithHandler(Acc, Target);
++}
++#endif // SYCL_EXT_SAMSUNG_PIM
++
+ } // namespace detail
+ } // namespace sycl
+ } // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/source/pim_handler.cpp b/sycl/source/pim_handler.cpp
+index 4670ea07a6f0..f14c3643da6c 100644
+--- a/sycl/source/pim_handler.cpp
++++ b/sycl/source/pim_handler.cpp
+@@ -6,6 +6,7 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#include <CL/sycl/detail/accessor_impl.hpp>
+ #include <detail/event_impl.hpp>
+ #include <sycl/ext/samsung/pim/pim_handler.hpp>
+ 
+@@ -54,6 +55,21 @@ event pim_handler::finalize() {
+   return detail::createSyclObjFromImpl<event>(Event);
+ }
+ 
++void pim_handler::associateWithHandler(detail::AccessorBaseHost *AccBase,
++                                       access::target AccTarget) {
++  detail::AccessorImplPtr AccImpl = detail::getSyclObjImpl(*AccBase);
++  detail::Requirement *Req = AccImpl.get();
++  // Add accessor to the list of requirements.
++  MRequirements.push_back(Req);
++  // Store copy of the accessor.
++  MAccStorage.push_back(std::move(AccImpl));
++  // Add an accessor to the handler list of associated accessors.
++  // For associated accessors index does not means nothing.
++  MAssociatedAccessors.emplace_back(detail::kernel_param_kind_t::kind_accessor,
++                                    Req, static_cast<int>(AccTarget),
++                                    /*index*/ 0);
++}
++
+ } // namespace samsung
+ } // namespace ext
+ } // namespace sycl
+-- 
+2.17.1
+

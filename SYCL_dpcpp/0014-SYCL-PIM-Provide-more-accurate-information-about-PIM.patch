@@ -1,0 +1,383 @@
+From d60dd38f8caabfd4d9ebad5afddbf6e3a73ea43f Mon Sep 17 00:00:00 2001
+From: Lukas Sommer <lukas.sommer@codeplay.com>
+Date: Mon, 15 Aug 2022 12:53:54 +0000
+Subject: [PATCH 14/17] [SYCL][PIM] Provide more accurate information about PIM
+ device
+
+---
+ sycl/plugins/hip/CMakeLists.txt       | 14 +----
+ sycl/plugins/hip/pi_hip.cpp           | 75 +++++++++++----------------
+ sycl/plugins/hip/pi_hip.hpp           |  3 +-
+ sycl/test/basic_tests/stream/byte.cpp |  3 --
+ sycl/tools/sycl-ls/sycl-ls.cpp        |  1 -
+ sycl/unittests/pi/CMakeLists.txt      |  9 ----
+ sycl/unittests/pi/EnqueueMemTest.cpp  | 21 --------
+ 7 files changed, 32 insertions(+), 94 deletions(-)
+
+diff --git a/sycl/plugins/hip/CMakeLists.txt b/sycl/plugins/hip/CMakeLists.txt
+index cf967ddbdaf6..c64cdf26c651 100644
+--- a/sycl/plugins/hip/CMakeLists.txt
++++ b/sycl/plugins/hip/CMakeLists.txt
+@@ -7,17 +7,13 @@ message(STATUS "Including the PI API HIP backend for ${SYCL_BUILD_PI_HIP_PLATFOR
+ # Enable support for Samsung PIM in the HIP PI plugin.
+ option(SYCL_HIP_PI_ENABLE_PIM "Enable PIM support in the HIP PI plugin" ON)
+ 
+-# The following option can be used for development of the PIM feature on 
+-# non-AMD machines.
+-option(SYCL_HIP_PI_STANDALONE_PIM "Enable PIM on non-AMD machines" OFF)
+-
+ # The following option can be used to replace the PIM SDK with a mock-up
+ # library for development purposes.
+ option(SYCL_HIP_PI_PIM_MOCK_LIBRARY "Replace PIM SDK with mock-up library" OFF)
+ 
+ # The following variable can be set by the user to provide the location
+ # of the PIM SDK library.
+-set(SYCL_BUILD_PI_HIP_PIM_SDK_DIR "/opt/rocm/pim" CACHE STRING 
++set(SYCL_BUILD_PI_HIP_PIM_SDK_DIR "/opt/rocm" CACHE STRING 
+     "Directory containing the PIM SDK library")
+ 
+ # Set default HIP include dirs
+@@ -90,17 +86,9 @@ endif()
+ 
+ # This option is currently evaluated on Nvidia and AMD platforms to allow
+ # development on Nvidia GPUs.
+-# TODO(Lukas) Evaluate on AMD only, because there's no Nvidia device 
+-# with Samsung PIM.
+ if(SYCL_ENABLE_PIM AND SYCL_HIP_PI_ENABLE_PIM)
+   target_compile_definitions(pi_hip PRIVATE __HIP_ENABLE_PIM__)
+ 
+-  # Additional compile definitions for development purposes.
+-  if(SYCL_HIP_PI_STANDALONE_PIM)
+-    # Development version on non-AMD machines
+-    target_compile_definitions(pi_hip PRIVATE __HIP_STANDALONE_PIM__)
+-  endif()
+-
+   # Link either against the mock-up library (PIMMock) or the actual PIM SDK.
+   if(SYCL_HIP_PI_PIM_MOCK_LIBRARY) 
+     # When building on non-AMD machines, always use the PIM mock library
+diff --git a/sycl/plugins/hip/pi_hip.cpp b/sycl/plugins/hip/pi_hip.cpp
+index 61ae1a7dd2e7..6808d74babff 100644
+--- a/sycl/plugins/hip/pi_hip.cpp
++++ b/sycl/plugins/hip/pi_hip.cpp
+@@ -949,13 +949,8 @@ pi_result hip_piPlatformsGet(pi_uint32 num_entries, pi_platform *platforms,
+             numPlatforms = 0;
+             return;
+           }
+-#ifdef __HIP_ENABLE_PIM__
+-          // Initialize the PIM runtime here.
+-          err = CHECK_PIM_ERROR(PimInitialize(RT_TYPE_HIP, PIM_FP16));
+-#endif // __HIP_ENABLE_PIM__
+ 
+           int numDevices = 0;
+-#ifndef __HIP_STANDALONE_PIM__
+           hipError_t hipErrorCode = hipGetDeviceCount(&numDevices);
+           if (hipErrorCode == hipErrorNoDevice) {
+             // This check has been deactivated to allow development
+@@ -970,7 +965,6 @@ pi_result hip_piPlatformsGet(pi_uint32 num_entries, pi_platform *platforms,
+             numPlatforms = 0;
+             return;
+           }
+-#endif // __HIP_STANDALONE_PIM__
+           try {
+ #ifdef __HIP_ENABLE_PIM__
+             platformIds.resize(numDevices + 1);
+@@ -1324,8 +1318,10 @@ pi_result getPIMDeviceInfo(pi_device device, pi_device_info param_name,
+     return getInfo(param_value_size, param_value, param_value_size_ret,
+                    0x144du);
+   }
+-  // TODO(Lukas, SP-14): See if there's any useful information or sensible
+-  // default we can return for these.
++  // The PIM blocks do not have the concept of work-groups or work-items. The
++  // PIM SDK also does not expose any API to query memory properties, to derive
++  // somewhat related information, e.g., from the number of memory banks or
++  // pseudo-channels.
+   case PI_DEVICE_INFO_MAX_WORK_ITEM_DIMENSIONS:
+   case PI_DEVICE_INFO_MAX_WORK_ITEM_SIZES:
+   case PI_EXT_ONEAPI_DEVICE_INFO_MAX_WORK_GROUPS_3D:
+@@ -1340,7 +1336,7 @@ pi_result getPIMDeviceInfo(pi_device device, pi_device_info param_name,
+                    PI_FALSE);
+   }
+   case PI_DEVICE_INFO_MAX_CLOCK_FREQUENCY: {
+-#ifdef __HIP_STANDALONE_PIM__
++#ifdef __HIP_MOCK_PIM__
+     // For systems that do not contain any actual AMD or PIM devices and just
+     // emulate the PIM hardware, return a value of 300 MHz. This value for the
+     // operating frequency of the PIM blocks was given in the paper *Hardware
+@@ -1348,20 +1344,23 @@ pi_result getPIMDeviceInfo(pi_device device, pi_device_info param_name,
+     // Technology : Industrial Product* by Lee et al.
+     // https://ieeexplore.ieee.org/document/9499894
+     return getInfo(param_value_size, param_value, param_value_size_ret, 300u);
+-#else  // __HIP_STANDALONE_PIM__
++#else  // __HIP_MOCK_PIM__
+     // On systems with AMD devices, we can query the HIP runtime for the memory
+     // clock rate. According to the paper, the PIM blocks will operate at the
+     // same frequency as the HBM2 DRAM.
+-    // TODO(Lukas, SP-14): Check that this is the actual frequency of the
+-    // memory, not the frequency of the memory bus (which is 4x higher).
+     int clock_freq = 0;
+     cl::sycl::detail::pi::assertion(
+         hipDeviceGetAttribute(&clock_freq, hipDeviceAttributeMemoryClockRate,
+-                              device->get()) == hipSuccess);
++                              device->get_underlying()) == hipSuccess);
+     cl::sycl::detail::pi::assertion(clock_freq >= 0);
++    // We need to divide by 4000 here (instead of 1000), because the frequency
++    // returned by HIP is the frequency of the memory bus, which is four times
++    // higher than the actual HBM memory frequency (according to the paper
++    // mentioned above). Note: If the PIM SDK adds an API to query device
++    // properties, this should use that API.
+     return getInfo(param_value_size, param_value, param_value_size_ret,
+-                   pi_uint32(clock_freq) / 1000u);
+-#endif // __HIP_STANDALONE_PIM__
++                   pi_uint32(clock_freq) / 4000u);
++#endif // __HIP_MOCK_PIM__
+   }
+   case PI_DEVICE_INFO_PREFERRED_VECTOR_WIDTH_CHAR: {
+     return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
+@@ -1410,8 +1409,12 @@ pi_result getPIMDeviceInfo(pi_device device, pi_device_info param_name,
+     return getInfo(param_value_size, param_value, param_value_size_ret, bits);
+   }
+   case PI_DEVICE_INFO_MAX_MEM_ALLOC_SIZE: {
+-    // TODO(Lukas, SP-14): Make sure we return a sensible value here.
+-    auto maxAlloc = 1024u * 1024u * 1024u;
++    // On the current MI100 prototype, 16GiB of PIM memory are available. The
++    // OpenCL standard mandates the maximum alloation size to be at least 1/4 of
++    // the global memory size, so we return 4 GiB here for now.
++    // Note: This fixed number should be replaced by per-device information as
++    // soon as the PIM SDK exposes an API to query device properties.
++    auto maxAlloc = 4ul * 1024ul * 1024ul * 1024ul;
+     return getInfo(param_value_size, param_value, param_value_size_ret,
+                    pi_uint64{maxAlloc});
+   }
+@@ -1439,8 +1442,7 @@ pi_result getPIMDeviceInfo(pi_device device, pi_device_info param_name,
+                    size_t{4000u});
+   }
+   case PI_DEVICE_INFO_MEM_BASE_ADDR_ALIGN: {
+-    // TODO(Lukas, SP-14): Check if this value makes sense, but the PIM blocks
+-    // operate at 256 bit/32 byte granularity.
++    // The PIM blocks operate at 256 bit/32 byte granularity.
+     return getInfo(param_value_size, param_value, param_value_size_ret, 32u);
+   }
+   case PI_DEVICE_INFO_HALF_FP_CONFIG: {
+@@ -1466,8 +1468,10 @@ pi_result getPIMDeviceInfo(pi_device device, pi_device_info param_name,
+     return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
+   }
+   case PI_DEVICE_INFO_GLOBAL_MEM_SIZE: {
+-    // TODO(Lukas, SP-14): Check if the PIM memory is 8 or 16 GiB.
+-    size_t bytes = 8ul * 1024ul * 1024ul * 1024ul;
++    // On the current MI100 prototype, 16GiB of PIM memory are available. Note:
++    // This fixed number should be replaced by per-device information as soon as
++    // the PIM SDK exposes an API to query device properties.
++    size_t bytes = 16ul * 1024ul * 1024ul * 1024ul;
+     return getInfo(param_value_size, param_value, param_value_size_ret,
+                    pi_uint64{bytes});
+   }
+@@ -1536,9 +1540,10 @@ pi_result getPIMDeviceInfo(pi_device device, pi_device_info param_name,
+     return getInfo(param_value_size, param_value, param_value_size_ret, 0u);
+   }
+   case PI_DEVICE_INFO_BUILT_IN_KERNELS: {
+-    // TODO(Lukas, SP-14): Can we return a list of the supported PIM operations
+-    // here?
+-    return getInfo(param_value_size, param_value, param_value_size_ret, "");
++    // Return a list of the supported PIM operations here, so the runtime could
++    // potentially query the abilities of the PIM device.
++    return getInfo(param_value_size, param_value, param_value_size_ret,
++                   "add, mul, gemv, relu, batchnorm");
+   }
+   case PI_DEVICE_INFO_PLATFORM: {
+     return getInfo(param_value_size, param_value, param_value_size_ret,
+@@ -2425,7 +2430,6 @@ pi_result hip_piContextCreate(const pi_context_properties *properties,
+   assert(retcontext != nullptr);
+   pi_result errcode_ret = PI_SUCCESS;
+ 
+-#ifndef __HIP_STANDALONE_PIM__
+   // Parse properties.
+   bool property_hip_primary = false;
+   while (properties && (0 != *properties)) {
+@@ -2447,17 +2451,11 @@ pi_result hip_piContextCreate(const pi_context_properties *properties,
+       return PI_INVALID_VALUE;
+     }
+   }
+-#endif // __HIP_STANDALONE_PIM__
+ 
+   std::unique_ptr<_pi_context> piContextPtr{nullptr};
+   try {
+     hipCtx_t current = nullptr;
+ 
+-#ifdef __HIP_STANDALONE_PIM__
+-    piContextPtr = std::unique_ptr<_pi_context>(
+-        new _pi_context{_pi_context::kind::user_defined, current, *devices});
+-
+-#else // __HIP_STANDALONE_PIM__
+ #ifdef __HIP_ENABLE_PIM__
+     // The device ID of the PIM device is not a valid device ID for the
+     // HIP/CUDA API. Currently, we assume that there is only a single GPU
+@@ -2466,8 +2464,6 @@ pi_result hip_piContextCreate(const pi_context_properties *properties,
+     auto underlyingDevice = (devices[0]->is_pim_device())
+                                 ? devices[0]->get_underlying()
+                                 : devices[0]->get();
+-    // TODO(Lukas): Call setDevice on PIM SDK
+-    // TODO(Lukas): Initialize PIM SDK here?
+ #else  // __HIP_ENABLE_PIM__
+     auto underlyingDevice = devices[0]->get();
+ #endif // __HIP_ENABLE_PIM__
+@@ -2503,7 +2499,6 @@ pi_result hip_piContextCreate(const pi_context_properties *properties,
+     if (current != nullptr) {
+       PI_CHECK_ERROR(hipCtxSetCurrent(current));
+     }
+-#endif // __HIP_STANDALONE_PIM__
+     *retcontext = piContextPtr.release();
+   } catch (pi_result err) {
+     errcode_ret = err;
+@@ -2524,10 +2519,6 @@ pi_result hip_piContextRelease(pi_context ctxt) {
+ 
+   std::unique_ptr<_pi_context> context{ctxt};
+ 
+-#ifdef __HIP_STANDALONE_PIM__
+-  return PI_SUCCESS;
+-#endif // __HIP_STANDALONE_PIM__
+-
+   PI_CHECK_ERROR(hipEventDestroy(context->evBase_));
+ 
+   if (!ctxt->is_primary()) {
+@@ -2607,8 +2598,6 @@ pi_result createPIMBuffer(pi_context context, pi_mem_flags flags, size_t size,
+   assert(!(flags & PI_MEM_FLAGS_HOST_PTR_ALLOC) &&
+          "Cannot map host pointers for use by PIM.");
+ 
+-  // TODO(Lukas): Handle cases where data needs to be moved from GPU memory to
+-  // PIM memory or vice versa.
+   int w = -1;
+   int h = -1;
+   int c = -1;
+@@ -3198,8 +3187,6 @@ pi_result hip_piEnqueueMemBufferWrite(pi_queue command_queue, pi_mem buffer,
+ 
+ #ifdef __HIP_ENABLE_PIM__
+     if (command_queue->device_->is_pim_device()) {
+-      // TODO(Lukas): PimCopyMemory doesn't accept a stream on its interface,
+-      // make sure we correctly synchronize and the event is correct.
+       retErr = CHECK_PIM_ERROR(PimCopyMemory(
+           buffer->mem_.pim_mem_.get_with_offset(offset), ptr, size,
+           getCopyType(PimCopyDirection::Host2Acc, buffer->mem_.pim_mem_.bo_)));
+@@ -3264,8 +3251,6 @@ pi_result hip_piEnqueueMemBufferRead(pi_queue command_queue, pi_mem buffer,
+ 
+ #ifdef __HIP_ENABLE_PIM__
+     if (command_queue->device_->is_pim_device()) {
+-      // TODO(Lukas): PimCopyMemory doesn't accept a stream on its interface,
+-      // make sure we correctly synchronize and the event is correct.
+       retErr = CHECK_PIM_ERROR(PimCopyMemory(
+           ptr, buffer->mem_.pim_mem_.get_with_offset(offset), size,
+           getCopyType(PimCopyDirection::Acc2Host, buffer->mem_.pim_mem_.bo_)));
+@@ -5087,8 +5072,6 @@ pi_result hip_piEnqueueMemBufferCopy(pi_queue command_queue, pi_mem src_buffer,
+ 
+ #ifdef __HIP_ENABLE_PIM__
+     if (command_queue->device_->is_pim_device()) {
+-      // TODO(Lukas): PimCopyMemory doesn't accept a stream on its interface,
+-      // make sure we correctly synchronize and the event is correct.
+       auto src = src_buffer->mem_.pim_mem_.get_with_offset(src_offset);
+       auto dst = dst_buffer->mem_.pim_mem_.get_with_offset(dst_offset);
+       result = CHECK_PIM_ERROR(PimCopyMemory(
+diff --git a/sycl/plugins/hip/pi_hip.hpp b/sycl/plugins/hip/pi_hip.hpp
+index 4e8328ed31ff..7847f0d8cd71 100644
+--- a/sycl/plugins/hip/pi_hip.hpp
++++ b/sycl/plugins/hip/pi_hip.hpp
+@@ -349,7 +349,8 @@ struct _pi_mem {
+     struct pim_mem_ {
+       using native_type = void *;
+ 
+-      // TODO(Lukas): Do we want to support sub-buffers here?
++      // Note: Sub-buffers are currently not supported for PIM devices/PIM
++      // memory.
+ 
+       /// Pointer to the underlying PIM buffer object.
+       PimBo *bo_;
+diff --git a/sycl/test/basic_tests/stream/byte.cpp b/sycl/test/basic_tests/stream/byte.cpp
+index b87ce0b46000..e20b7231dfe1 100644
+--- a/sycl/test/basic_tests/stream/byte.cpp
++++ b/sycl/test/basic_tests/stream/byte.cpp
+@@ -5,9 +5,6 @@
+ 
+ int main() {
+   sycl::queue q;
+-  // TODO(Lukas, SP-20): Had to replace the 'auto' parameter of this lambda,
+-  // because the dispatch to the correct handler type in the queue doesn't work
+-  // for this case.
+   q.submit([](sycl::handler &h) {
+     sycl::stream os(1024, 256, h);
+     h.single_task([=] { os << std::byte(2) << "\n"; });
+diff --git a/sycl/tools/sycl-ls/sycl-ls.cpp b/sycl/tools/sycl-ls/sycl-ls.cpp
+index 4fca85839a8d..bd29c81d33d3 100644
+--- a/sycl/tools/sycl-ls/sycl-ls.cpp
++++ b/sycl/tools/sycl-ls/sycl-ls.cpp
+@@ -172,7 +172,6 @@ int main(int argc, char **argv) {
+   printSelectorChoice(accelerator_selector(), "accelerator_selector()  : ");
+   printSelectorChoice(cpu_selector(), "cpu_selector()          : ");
+   printSelectorChoice(gpu_selector(), "gpu_selector()          : ");
+-  // TODO(Lukas): Print custom/PIM selector choice.
+ 
+   // Print trivial custom selectors choice
+   printSelectorChoice(custom_selector(info::device_type::gpu),
+diff --git a/sycl/unittests/pi/CMakeLists.txt b/sycl/unittests/pi/CMakeLists.txt
+index ee1e2ec6bbfd..899b2a8f3ab9 100644
+--- a/sycl/unittests/pi/CMakeLists.txt
++++ b/sycl/unittests/pi/CMakeLists.txt
+@@ -12,19 +12,10 @@ add_dependencies(PiTests sycl)
+ target_include_directories(PiTests PRIVATE SYSTEM ${sycl_inc_dir})
+ target_include_directories(PiTests PRIVATE ${sycl_src_dir}/../tools/xpti_helpers)
+ 
+-# This option is only evaluated on the AMD platform because currently,
+-# there's no Nvidia device with Samsung PIM.
+ if(SYCL_HIP_PI_ENABLE_PIM)
+   target_compile_definitions(PiTests PRIVATE __HIP_ENABLE_PIM__)
+ endif()
+ 
+-# This option is only evaluated on the AMD platform because currently,
+-# there's no Nvidia device with Samsung PIM.
+-if(SYCL_HIP_PI_STANDALONE_PIM AND SYCL_HIP_PI_ENABLE_PIM)
+-  message(STATUS "PIM STANDALONE")
+-  target_compile_definitions(PiTests PRIVATE __HIP_STANDALONE_PIM__)
+-endif()
+-
+ if("cuda" IN_LIST SYCL_ENABLE_PLUGINS)
+     add_subdirectory(cuda)
+ endif()
+diff --git a/sycl/unittests/pi/EnqueueMemTest.cpp b/sycl/unittests/pi/EnqueueMemTest.cpp
+index a0015d71cf3e..5e001acc2ba9 100644
+--- a/sycl/unittests/pi/EnqueueMemTest.cpp
++++ b/sycl/unittests/pi/EnqueueMemTest.cpp
+@@ -32,17 +32,6 @@ protected:
+ 
+     detail::plugin plugin = GetParam();
+ 
+-#ifdef __HIP_STANDALONE_PIM__
+-    bool skipTest = plugin.getBackend() == cl::sycl::backend::ext_oneapi_hip;
+-#else  // __HIP_STANDALONE_PIM__
+-    bool skipTest = false;
+-#endif // __HIP_STANDALONE_PIM__
+-
+-    if (skipTest) {
+-      GTEST_SKIP() << "Skipping test for standalone PIM device";
+-      return;
+-    }
+-
+     pi_platform platform = nullptr;
+     ASSERT_EQ((plugin.call_nocheck<detail::PiApiKind::piPlatformsGet>(
+                   1, &platform, nullptr)),
+@@ -72,16 +61,6 @@ protected:
+ 
+     detail::plugin plugin = GetParam();
+ 
+-#ifdef __HIP_STANDALONE_PIM__
+-    bool skipTest = plugin.getBackend() == cl::sycl::backend::ext_oneapi_hip;
+-#else  // __HIP_STANDALONE_PIM__
+-    bool skipTest = false;
+-#endif // __HIP_STANDALONE_PIM__
+-
+-    if (skipTest) {
+-      return;
+-    }
+-
+     ASSERT_EQ((plugin.call_nocheck<detail::PiApiKind::piMemRelease>(_mem)),
+               PI_SUCCESS);
+     ASSERT_EQ((plugin.call_nocheck<detail::PiApiKind::piQueueRelease>(_queue)),
+-- 
+2.17.1
+

@@ -1,0 +1,78 @@
+From a2ae8fcc4d7b904466aa005c7201ed186a8c19f5 Mon Sep 17 00:00:00 2001
+From: Lukas Sommer <lukas.sommer@codeplay.com>
+Date: Thu, 30 Jun 2022 08:38:37 +0100
+Subject: [PATCH 10/17] [SYCL][PIM] Add PIM device selector
+
+---
+ sycl/include/CL/sycl/device_selector.hpp | 18 ++++++++++++++++++
+ sycl/source/device_selector.cpp          | 19 +++++++++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/sycl/include/CL/sycl/device_selector.hpp b/sycl/include/CL/sycl/device_selector.hpp
+index 17b1503488a3..319cfd31ccf8 100644
+--- a/sycl/include/CL/sycl/device_selector.hpp
++++ b/sycl/include/CL/sycl/device_selector.hpp
+@@ -10,6 +10,7 @@
+ 
+ #include <CL/sycl/detail/defines.hpp>
+ #include <CL/sycl/detail/export.hpp>
++#include <CL/sycl/feature_test.hpp>
+ 
+ // 4.6.1 Device selection class
+ 
+@@ -87,5 +88,22 @@ class __SYCL_EXPORT host_selector : public device_selector {
+ public:
+   int operator()(const device &dev) const override;
+ };
++
++#if SYCL_EXT_SAMSUNG_PIM
++namespace ext {
++namespace samsung {
++/// Selects any SYCL PIM device.
++///
++/// \sa device
++///
++/// \ingroup sycl_api_dev_sel
++class __SYCL_EXPORT pim_selector : public device_selector {
++public:
++  int operator()(const device &dev) const override;
++};
++} // namespace samsung
++} // namespace ext
++#endif // SYCL_EXT_SAMSUNG_PIM
++
+ } // namespace sycl
+ } // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/source/device_selector.cpp b/sycl/source/device_selector.cpp
+index 7bfa93ca7abd..9fb9ecef1296 100644
+--- a/sycl/source/device_selector.cpp
++++ b/sycl/source/device_selector.cpp
+@@ -188,6 +188,25 @@ int host_selector::operator()(const device &dev) const {
+   return Score;
+ }
+ 
++#if SYCL_EXT_SAMSUNG_PIM
++namespace ext {
++namespace samsung {
++int pim_selector::operator()(const device &dev) const {
++  int Score = REJECT_DEVICE_SCORE;
++
++  if (dev.has(sycl::aspect::ext_samsung_pim)) {
++    Score = 1000;
++    // Give preference to device of SYCL BE.
++    if (isDeviceOfPreferredSyclBe(dev)) {
++      Score += 50;
++    }
++  }
++  return Score;
++}
++} // namespace samsung
++} // namespace ext
++#endif // SYCL_EXT_SAMSUNG_PIM
++
+ namespace ext {
+ namespace oneapi {
+ 
+-- 
+2.17.1
+

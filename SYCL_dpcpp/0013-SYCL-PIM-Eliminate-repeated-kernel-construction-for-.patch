@@ -1,0 +1,839 @@
+From df19348b64d2ab25628a2263e3089499ab617761 Mon Sep 17 00:00:00 2001
+From: Lukas Sommer <lukas.sommer@codeplay.com>
+Date: Fri, 5 Aug 2022 11:13:42 +0100
+Subject: [PATCH 13/17] [SYCL][PIM] Eliminate repeated kernel construction for
+ PIM operations
+
+Cache PIM "kernels" to avoid populating repeatedly;
+
+Pass scalar arguments by value and not by pointer to PIM PI kernels;
+---
+ .../sycl/ext/samsung/pim/pim_accessor.hpp     |  14 +-
+ .../sycl/ext/samsung/pim/pim_handler.hpp      |   8 +-
+ sycl/plugins/hip/pi_hip.cpp                   |  14 +-
+ sycl/source/detail/scheduler/commands.cpp     | 155 ++++++++++-----
+ sycl/source/detail/scheduler/commands.hpp     |   4 +
+ sycl/unittests/pi/pim/test_pim_operations.cpp | 182 ++++++++----------
+ 6 files changed, 205 insertions(+), 172 deletions(-)
+
+diff --git a/sycl/include/sycl/ext/samsung/pim/pim_accessor.hpp b/sycl/include/sycl/ext/samsung/pim/pim_accessor.hpp
+index da95611282c7..50e383066fc9 100644
+--- a/sycl/include/sycl/ext/samsung/pim/pim_accessor.hpp
++++ b/sycl/include/sycl/ext/samsung/pim/pim_accessor.hpp
+@@ -65,8 +65,8 @@ public:
+       const detail::code_location CodeLoc = detail::code_location::current())
+       : AccessorBaseHost(
+             /*Offset=*/{0, 0, 0},
+-            ::sycl::detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+-            ::sycl::detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
++            sycl::detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
++            sycl::detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+             getAdjustedMode<AccessMode>(PropList),
+             detail::getSyclObjImpl(BufferRef).get(), Dimensions, sizeof(DataT),
+             BufferRef.OffsetInBytes, BufferRef.IsSubBuffer) {
+@@ -94,9 +94,9 @@ public:
+       id<Dimensions> AccessOffset, const property_list &PropList = {},
+       const detail::code_location CodeLoc = detail::code_location::current())
+       : AccessorBaseHost(
+-            ::sycl::detail::convertToArrayOfN<3, 0>(AccessOffset),
+-            ::sycl::detail::convertToArrayOfN<3, 1>(AccessRange),
+-            ::sycl::detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
++            sycl::detail::convertToArrayOfN<3, 0>(AccessOffset),
++            sycl::detail::convertToArrayOfN<3, 1>(AccessRange),
++            sycl::detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+             getAdjustedMode<AccessMode>(PropList),
+             detail::getSyclObjImpl(BufferRef).get(), Dimensions, sizeof(DataT),
+             BufferRef.OffsetInBytes, BufferRef.IsSubBuffer) {
+@@ -157,12 +157,12 @@ public:
+ 
+   /* Available only when: (Dimensions > 0) */
+   range<Dimensions> get_range() const {
+-    return ::sycl::detail::convertToArrayOfN<Dimensions, 1>(getAccessRange());
++    return sycl::detail::convertToArrayOfN<Dimensions, 1>(getAccessRange());
+   }
+ 
+   /* Available only when: (Dimensions > 0) */
+   id<Dimensions> get_offset() const {
+-    return ::sycl::detail::convertToArrayOfN<Dimensions, 1>(getOffset());
++    return sycl::detail::convertToArrayOfN<Dimensions, 1>(getOffset());
+   }
+ };
+ 
+diff --git a/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp b/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
+index c74e270084c9..158294f4ed1e 100644
+--- a/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
++++ b/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
+@@ -276,10 +276,10 @@ private:
+     // the accessor.
+     // Make sure that the range/offset information is in the organized as
+     // {width, height, depth}.
+-    auto AccRange = ::sycl::detail::convertRangeToXYZ(
+-        ::sycl::detail::convertToArrayOfN<3, 1>(Arg.get_range()), DataDim);
+-    auto AccOffset = ::sycl::detail::convertRangeToXYZ(
+-        ::sycl::detail::convertToArrayOfN<3, 0>(Arg.get_offset()), DataDim);
++    auto AccRange = sycl::detail::convertRangeToXYZ(
++        sycl::detail::convertToArrayOfN<3, 1>(Arg.get_range()), DataDim);
++    auto AccOffset = sycl::detail::convertRangeToXYZ(
++        sycl::detail::convertToArrayOfN<3, 0>(Arg.get_offset()), DataDim);
+     setScalarArgHelper(ArgIndex + 1, AccRange[0]);
+     setScalarArgHelper(ArgIndex + 2, AccRange[1]);
+     setScalarArgHelper(ArgIndex + 3, AccRange[2]);
+diff --git a/sycl/plugins/hip/pi_hip.cpp b/sycl/plugins/hip/pi_hip.cpp
+index 648e46749981..61ae1a7dd2e7 100644
+--- a/sycl/plugins/hip/pi_hip.cpp
++++ b/sycl/plugins/hip/pi_hip.cpp
+@@ -241,12 +241,12 @@ pi_result executePIMOperation(pi_kernel kernel, pi_queue command_queue) {
+ bool getRangedBufferWithOffset(const std::vector<void *> &arguments,
+                                size_t index, PimBo **buffer) {
+   *buffer = *static_cast<PimBo **>(arguments[index]);
+-  size_t rangeX = **static_cast<size_t **>(arguments[index + 1]);
+-  size_t rangeY = **static_cast<size_t **>(arguments[index + 2]);
+-  size_t rangeZ = **static_cast<size_t **>(arguments[index + 3]);
+-  size_t offsetX = **static_cast<size_t **>(arguments[index + 4]);
+-  size_t offsetY = **static_cast<size_t **>(arguments[index + 5]);
+-  size_t offsetZ = **static_cast<size_t **>(arguments[index + 6]);
++  size_t rangeX = *static_cast<size_t *>(arguments[index + 1]);
++  size_t rangeY = *static_cast<size_t *>(arguments[index + 2]);
++  size_t rangeZ = *static_cast<size_t *>(arguments[index + 3]);
++  size_t offsetX = *static_cast<size_t *>(arguments[index + 4]);
++  size_t offsetY = *static_cast<size_t *>(arguments[index + 5]);
++  size_t offsetZ = *static_cast<size_t *>(arguments[index + 6]);
+   auto shape = (*buffer)->bshape;
+   if (offsetX || offsetY || offsetZ || shape.w != rangeX || shape.h != rangeY ||
+       shape.c != rangeZ) {
+@@ -316,7 +316,7 @@ pi_result executeScalarPIMOperation(pi_kernel kernel, pi_queue command_queue,
+   if (getRangedBufferWithOffset(arguments, 0, &output)) {
+     kernel->addPimBuffer(output);
+   }
+-  void *operand0 = *static_cast<void **>(arguments[7]);
++  void *operand0 = arguments[7];
+   PimBo *operand1 = nullptr;
+   if (getRangedBufferWithOffset(arguments, 8, &operand1)) {
+     kernel->addPimBuffer(operand1);
+diff --git a/sycl/source/detail/scheduler/commands.cpp b/sycl/source/detail/scheduler/commands.cpp
+index 1245e29ac068..cd9989ef8047 100644
+--- a/sycl/source/detail/scheduler/commands.cpp
++++ b/sycl/source/detail/scheduler/commands.cpp
+@@ -2652,67 +2652,78 @@ pi_result ExecCGCommand::LaunchPimOperation(
+   }
+   assert(DummyProgram != nullptr);
+ 
+-  // Create a new PI kernel. This is not an actual kernel that gets executed,
+-  // but rather a container for arguments and information about which operation
+-  // to execute. The kernel is added to the cache to manage the lifetime
+-  // attached to it.
++  // Create an identifier for this PIM operation, using the type of operation
++  // and the arguments to uniquely identify combinations of operation and
++  // arguments.
++  auto PimOpType = translatePimOpType(Op);
++  if (PimOpType.empty()) {
++    return PI_INVALID_OPERATION;
++  }
++  auto KernelIdentifier =
++      getPIMKernelIdentifier(PimOpType, Args, getMemAllocationFunc);
++
++  // First, check the cache if this combination of PIM operation and arguments
++  // has been encountered before. If this is the case, the kernel can be
++  // res-used. If not, create a new PI kernel. This is not an actual kernel that
++  // gets executed, but rather a container for arguments and information about
++  // which operation to execute. The kernel is added to the cache.
+   RT::PiKernel OpKernel = nullptr;
++  bool KernelCacheHit = false;
+   {
+-    static size_t KernelID = 0;
+     auto LockedCache = KernelCache.acquireKernelsPerProgramCache();
++    auto &Cache = LockedCache.get()[DummyProgram];
++    auto CachedKernel = Cache.find(KernelIdentifier);
++    if (CachedKernel != Cache.end()) {
++      OpKernel = CachedKernel->second.Ptr.load();
++      KernelCacheHit = true;
++    } else {
++      Plugin.call<detail::PiApiKind::piKernelCreate>(
++          DummyProgram, PimOpType.c_str(), &OpKernel);
+ 
+-    auto KernelIdentifier = translatePimOpType(Op);
+-    if (KernelIdentifier.empty()) {
+-      return PI_INVALID_OPERATION;
++      Cache.emplace(std::piecewise_construct,
++                    std::forward_as_tuple(KernelIdentifier),
++                    std::forward_as_tuple(OpKernel, 1));
++      KernelCacheHit = false;
+     }
++  }
++  assert(OpKernel != nullptr);
+ 
+-    Plugin.call<detail::PiApiKind::piKernelCreate>(
+-        DummyProgram, KernelIdentifier.c_str(), &OpKernel);
++  if (!KernelCacheHit) {
+ 
+-    LockedCache.get()[DummyProgram].emplace(
+-        std::piecewise_construct,
+-        /*Create a unique name as key for the cache*/
+-        std::forward_as_tuple("pim_kernel_" + std::to_string(KernelID++)),
+-        std::forward_as_tuple(OpKernel, 1));
+-  }
++    auto setFunc = [&Plugin, OpKernel,
++                    &getMemAllocationFunc](detail::ArgDesc &Arg) {
++      switch (Arg.MType) {
++      case kernel_param_kind_t::kind_accessor: {
++        auto *Req = static_cast<Requirement *>(Arg.MPtr);
++        assert(getMemAllocationFunc != nullptr && "The function should not "
++                                                  "be nullptr as we "
++                                                  "followed the path for "
++                                                  "which accessors are "
++                                                  "used");
++        RT::PiMem MemArg = static_cast<RT::PiMem>(getMemAllocationFunc(Req));
++        Plugin.call<PiApiKind::piextKernelSetArgMemObj>(OpKernel, Arg.MIndex,
++                                                        &MemArg);
++        break;
++      }
++      case kernel_param_kind_t::kind_std_layout: {
++        auto size = Arg.MSize;
++        void *ptr = Arg.MPtr;
++        Plugin.call<PiApiKind::piKernelSetArg>(OpKernel, Arg.MIndex, size, ptr);
++        break;
++      }
++      case kernel_param_kind_t::kind_invalid:
++        throw runtime_error("Invalid kernel param kind", PI_INVALID_VALUE);
++        break;
++      default:
++        throw runtime_error("Argument type not supported by PIM",
++                            PI_INVALID_VALUE);
++        break;
++      }
++    };
+ 
+-  auto setFunc = [&Plugin, OpKernel,
+-                  &getMemAllocationFunc](detail::ArgDesc &Arg) {
+-    switch (Arg.MType) {
+-    case kernel_param_kind_t::kind_accessor: {
+-      auto *Req = static_cast<Requirement *>(Arg.MPtr);
+-      assert(getMemAllocationFunc != nullptr && "The function should not "
+-                                                "be nullptr as we "
+-                                                "followed the path for "
+-                                                "which accessors are "
+-                                                "used");
+-      RT::PiMem MemArg = static_cast<RT::PiMem>(getMemAllocationFunc(Req));
+-      Plugin.call<PiApiKind::piextKernelSetArgMemObj>(OpKernel, Arg.MIndex,
+-                                                      &MemArg);
+-      break;
+-    }
+-    case kernel_param_kind_t::kind_std_layout: {
+-      // The PIM SDK does not take scalar arguments by value, but by pointer, so
+-      // we need to pass pointer-to-pointer to the PI. The command and
+-      // command-group should outlast the execution of the command, to it is
+-      // safe to use the pointer into the command argument storage here.
+-      auto size = sizeof(Arg.MPtr);
+-      void **ptr = &Arg.MPtr;
+-      Plugin.call<PiApiKind::piKernelSetArg>(OpKernel, Arg.MIndex, size, ptr);
+-      break;
+-    }
+-    case kernel_param_kind_t::kind_invalid:
+-      throw runtime_error("Invalid kernel param kind", PI_INVALID_VALUE);
+-      break;
+-    default:
+-      throw runtime_error("Argument type not supported by PIM",
+-                          PI_INVALID_VALUE);
+-      break;
++    for (auto &Arg : Args) {
++      setFunc(Arg);
+     }
+-  };
+-
+-  for (auto &Arg : Args) {
+-    setFunc(Arg);
+   }
+ 
+   pi_result Error =
+@@ -2741,6 +2752,46 @@ std::string ExecCGCommand::translatePimOpType(CGPim::PIM_OPERATION Op) {
+   }
+ }
+ 
++std::string ExecCGCommand::getPIMKernelIdentifier(
++    const std::string &OpType, const std::vector<ArgDesc> &Args,
++    const std::function<void *(Requirement *Req)> &getMemAllocationFunc) {
++  std::stringstream Identifier;
++  Identifier << OpType;
++  auto ToIdentifier = [&Identifier,
++                       &getMemAllocationFunc](const detail::ArgDesc &Arg) {
++    switch (Arg.MType) {
++    case kernel_param_kind_t::kind_accessor: {
++      auto *Req = static_cast<Requirement *>(Arg.MPtr);
++      assert(getMemAllocationFunc != nullptr && "The function should not "
++                                                "be nullptr as we "
++                                                "followed the path for "
++                                                "which accessors are "
++                                                "used");
++      RT::PiMem MemArg = static_cast<RT::PiMem>(getMemAllocationFunc(Req));
++      Identifier << "_" << MemArg;
++      break;
++    }
++    case kernel_param_kind_t::kind_std_layout: {
++      size_t ScalarArg = *(static_cast<size_t *>(Arg.MPtr));
++      Identifier << "_" << ScalarArg;
++      break;
++    }
++    case kernel_param_kind_t::kind_invalid:
++      throw runtime_error("Invalid kernel param kind", PI_INVALID_VALUE);
++      break;
++    default:
++      throw runtime_error("Argument type not supported by PIM",
++                          PI_INVALID_VALUE);
++      break;
++    }
++  };
++  for (auto &Arg : Args) {
++    ToIdentifier(Arg);
++  }
++  auto StrIdentifier = Identifier.str();
++  return StrIdentifier;
++}
++
+ namespace {
+ 
+ PimBo *createPIMBufferFromArgs(
+diff --git a/sycl/source/detail/scheduler/commands.hpp b/sycl/source/detail/scheduler/commands.hpp
+index 2d60cc338e4e..235dc9b0d8f3 100644
+--- a/sycl/source/detail/scheduler/commands.hpp
++++ b/sycl/source/detail/scheduler/commands.hpp
+@@ -578,6 +578,10 @@ private:
+ 
+   std::string translatePimOpType(CGPim::PIM_OPERATION Op);
+ 
++  std::string getPIMKernelIdentifier(
++      const std::string &OpType, const std::vector<ArgDesc> &Args,
++      const std::function<void *(Requirement *Req)> &getMemAllocationFunc);
++
+   std::unique_ptr<detail::CG> MCommandGroup;
+ 
+   friend class Command;
+diff --git a/sycl/unittests/pi/pim/test_pim_operations.cpp b/sycl/unittests/pi/pim/test_pim_operations.cpp
+index 611b5c7abcec..b9a4888524ee 100644
+--- a/sycl/unittests/pi/pim/test_pim_operations.cpp
++++ b/sycl/unittests/pi/pim/test_pim_operations.cpp
+@@ -86,10 +86,6 @@ TEST_F(PimTestOperations, pimVectorAddOperation) {
+   size_t H = 8;
+   size_t C = 4;
+   size_t Offset = 0;
+-  auto *W_ptr = &W;
+-  auto *H_ptr = &H;
+-  auto *C_ptr = &C;
+-  auto *O_ptr = &Offset;
+   pi_program dummyProgram = nullptr;
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piProgramCreate>(
+                 context_, nullptr, 0, &dummyProgram)),
+@@ -133,27 +129,27 @@ TEST_F(PimTestOperations, pimVectorAddOperation) {
+             PI_SUCCESS);
+   // Pass the width of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 1, sizeof(sycl::half *), &W_ptr)),
++                opKernel, 1, sizeof(sycl::half *), &W)),
+             PI_SUCCESS);
+   // Pass the height of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 2, sizeof(sycl::half *), &H_ptr)),
++                opKernel, 2, sizeof(sycl::half *), &H)),
+             PI_SUCCESS);
+   // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 3, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 3, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass X component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 4, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 4, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Y component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 5, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 5, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Z component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 6, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 6, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+@@ -162,27 +158,27 @@ TEST_F(PimTestOperations, pimVectorAddOperation) {
+ 
+   // Pass the width of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 8, sizeof(sycl::half *), &W_ptr)),
++                opKernel, 8, sizeof(sycl::half *), &W)),
+             PI_SUCCESS);
+   // Pass the height of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 9, sizeof(sycl::half *), &H_ptr)),
++                opKernel, 9, sizeof(sycl::half *), &H)),
+             PI_SUCCESS);
+   // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 10, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 10, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass X component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 11, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 11, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Y component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 12, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 12, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Z component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 13, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 13, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+@@ -191,27 +187,27 @@ TEST_F(PimTestOperations, pimVectorAddOperation) {
+ 
+   // Pass the width of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 15, sizeof(sycl::half *), &W_ptr)),
++                opKernel, 15, sizeof(sycl::half *), &W)),
+             PI_SUCCESS);
+   // Pass the height of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 16, sizeof(sycl::half *), &H_ptr)),
++                opKernel, 16, sizeof(sycl::half *), &H)),
+             PI_SUCCESS);
+   // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 17, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 17, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass X component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 18, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 18, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Y component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 19, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 19, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Z component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 20, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 20, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ(
+@@ -251,10 +247,6 @@ TEST_F(PimTestOperations, pimVectorMulOperation) {
+   size_t H = 8;
+   size_t C = 4;
+   size_t Offset = 0;
+-  auto *W_ptr = &W;
+-  auto *H_ptr = &H;
+-  auto *C_ptr = &C;
+-  auto *O_ptr = &Offset;
+   pi_program dummyProgram = nullptr;
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piProgramCreate>(
+                 context_, nullptr, 0, &dummyProgram)),
+@@ -300,27 +292,27 @@ TEST_F(PimTestOperations, pimVectorMulOperation) {
+ 
+   // Pass the width of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 1, sizeof(sycl::half *), &W_ptr)),
++                opKernel, 1, sizeof(sycl::half *), &W)),
+             PI_SUCCESS);
+   // Pass the height of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 2, sizeof(sycl::half *), &H_ptr)),
++                opKernel, 2, sizeof(sycl::half *), &H)),
+             PI_SUCCESS);
+   // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 3, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 3, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass X component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 4, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 4, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Y component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 5, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 5, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Z component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 6, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 6, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+@@ -329,27 +321,27 @@ TEST_F(PimTestOperations, pimVectorMulOperation) {
+ 
+   // Pass the width of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 8, sizeof(sycl::half *), &W_ptr)),
++                opKernel, 8, sizeof(sycl::half *), &W)),
+             PI_SUCCESS);
+   // Pass the height of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 9, sizeof(sycl::half *), &H_ptr)),
++                opKernel, 9, sizeof(sycl::half *), &H)),
+             PI_SUCCESS);
+   // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 10, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 10, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass X component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 11, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 11, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Y component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 12, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 12, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Z component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 13, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 13, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+@@ -358,27 +350,27 @@ TEST_F(PimTestOperations, pimVectorMulOperation) {
+ 
+   // Pass the width of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 15, sizeof(sycl::half *), &W_ptr)),
++                opKernel, 15, sizeof(sycl::half *), &W)),
+             PI_SUCCESS);
+   // Pass the height of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 16, sizeof(sycl::half *), &H_ptr)),
++                opKernel, 16, sizeof(sycl::half *), &H)),
+             PI_SUCCESS);
+   // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 17, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 17, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass X component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 18, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 18, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Y component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 19, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 19, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Z component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 20, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 20, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   pi_event event;
+   ASSERT_EQ(
+@@ -420,10 +412,6 @@ TEST_F(PimTestOperations, pimScalarAddOperation) {
+   size_t H = 8;
+   size_t C = 4;
+   size_t Offset = 0;
+-  auto *W_ptr = &W;
+-  auto *H_ptr = &H;
+-  auto *C_ptr = &C;
+-  auto *O_ptr = &Offset;
+   pi_program dummyProgram = nullptr;
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piProgramCreate>(
+                 context_, nullptr, 0, &dummyProgram)),
+@@ -444,7 +432,6 @@ TEST_F(PimTestOperations, pimScalarAddOperation) {
+     vecInput[i] = static_cast<sycl::half>(i);
+   }
+   sycl::half scalarInput = static_cast<sycl::half>(5.0);
+-  auto *scalarArg = &scalarInput;
+ 
+   pi_mem inputBuf;
+   pi_mem outputBuf;
+@@ -464,31 +451,31 @@ TEST_F(PimTestOperations, pimScalarAddOperation) {
+ 
+   // Pass the width of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 1, sizeof(sycl::half *), &W_ptr)),
++                opKernel, 1, sizeof(sycl::half *), &W)),
+             PI_SUCCESS);
+   // Pass the height of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 2, sizeof(sycl::half *), &H_ptr)),
++                opKernel, 2, sizeof(sycl::half *), &H)),
+             PI_SUCCESS);
+   // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 3, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 3, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass X component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 4, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 4, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Y component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 5, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 5, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Z component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 6, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 6, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 7, sizeof(sycl::half *), &scalarArg)),
++                opKernel, 7, sizeof(sycl::half *), &scalarInput)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+@@ -497,27 +484,27 @@ TEST_F(PimTestOperations, pimScalarAddOperation) {
+ 
+   // Pass the width of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 9, sizeof(sycl::half *), &W_ptr)),
++                opKernel, 9, sizeof(sycl::half *), &W)),
+             PI_SUCCESS);
+   // Pass the height of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 10, sizeof(sycl::half *), &H_ptr)),
++                opKernel, 10, sizeof(sycl::half *), &H)),
+             PI_SUCCESS);
+   // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 11, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 11, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass X component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 12, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 12, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Y component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 13, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 13, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Z component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 14, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 14, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ(
+@@ -554,10 +541,6 @@ TEST_F(PimTestOperations, pimScalarMulOperation) {
+   size_t H = 8;
+   size_t C = 4;
+   size_t Offset = 0;
+-  auto *W_ptr = &W;
+-  auto *H_ptr = &H;
+-  auto *C_ptr = &C;
+-  auto *O_ptr = &Offset;
+   pi_program dummyProgram = nullptr;
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piProgramCreate>(
+                 context_, nullptr, 0, &dummyProgram)),
+@@ -578,7 +561,6 @@ TEST_F(PimTestOperations, pimScalarMulOperation) {
+     vecInput[i] = static_cast<sycl::half>(i);
+   }
+   sycl::half scalarInput = static_cast<sycl::half>(2.0);
+-  auto *scalarArg = &scalarInput;
+ 
+   pi_mem inputBuf;
+   pi_mem outputBuf;
+@@ -598,31 +580,31 @@ TEST_F(PimTestOperations, pimScalarMulOperation) {
+ 
+   // Pass the width of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 1, sizeof(sycl::half *), &W_ptr)),
++                opKernel, 1, sizeof(sycl::half *), &W)),
+             PI_SUCCESS);
+   // Pass the height of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 2, sizeof(sycl::half *), &H_ptr)),
++                opKernel, 2, sizeof(sycl::half *), &H)),
+             PI_SUCCESS);
+   // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 3, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 3, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass X component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 4, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 4, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Y component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 5, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 5, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Z component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 6, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 6, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 7, sizeof(sycl::half *), &scalarArg)),
++                opKernel, 7, sizeof(sycl::half *), &scalarInput)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+@@ -631,27 +613,27 @@ TEST_F(PimTestOperations, pimScalarMulOperation) {
+ 
+   // Pass the width of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 9, sizeof(sycl::half *), &W_ptr)),
++                opKernel, 9, sizeof(sycl::half *), &W)),
+             PI_SUCCESS);
+   // Pass the height of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 10, sizeof(sycl::half *), &H_ptr)),
++                opKernel, 10, sizeof(sycl::half *), &H)),
+             PI_SUCCESS);
+   // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 11, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 11, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass X component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 12, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 12, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Y component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 13, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 13, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Z component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 14, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 14, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ(
+@@ -688,10 +670,6 @@ TEST_F(PimTestOperations, pimGEMVOperation) {
+   constexpr size_t N = 256;
+   constexpr size_t C = 1;
+   constexpr size_t Offset = 0;
+-  auto *M_ptr = &M;
+-  auto *N_ptr = &N;
+-  auto *C_ptr = &C;
+-  auto *O_ptr = &Offset;
+   std::string dataDir{__PIM_MATRIX_DATA__};
+   std::array<sycl::half, M * N> matrix;
+   ASSERT_TRUE(pim::detail::readFromFile(dataDir + "mat.data", matrix.data(),
+@@ -751,27 +729,27 @@ TEST_F(PimTestOperations, pimGEMVOperation) {
+ 
+   // Pass the width of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 1, sizeof(sycl::half *), &M_ptr)),
++                opKernel, 1, sizeof(sycl::half *), &M)),
+             PI_SUCCESS);
+   // Pass the height of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 2, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 2, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 3, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 3, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass X component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 4, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 4, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Y component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 5, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 5, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Z component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 6, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 6, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+@@ -780,27 +758,27 @@ TEST_F(PimTestOperations, pimGEMVOperation) {
+ 
+   // Pass the width of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 8, sizeof(sycl::half *), &N_ptr)),
++                opKernel, 8, sizeof(sycl::half *), &N)),
+             PI_SUCCESS);
+   // Pass the height of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 9, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 9, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 10, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 10, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass X component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 11, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 11, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Y component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 12, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 12, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Z component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 13, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 13, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+@@ -809,27 +787,27 @@ TEST_F(PimTestOperations, pimGEMVOperation) {
+ 
+   // Pass the width of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 15, sizeof(sycl::half *), &N_ptr)),
++                opKernel, 15, sizeof(sycl::half *), &N)),
+             PI_SUCCESS);
+   // Pass the height of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 16, sizeof(sycl::half *), &M_ptr)),
++                opKernel, 16, sizeof(sycl::half *), &M)),
+             PI_SUCCESS);
+   // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 17, sizeof(sycl::half *), &C_ptr)),
++                opKernel, 17, sizeof(sycl::half *), &C)),
+             PI_SUCCESS);
+   // Pass X component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 18, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 18, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Y component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 19, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 19, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+   // Pass Z component of offset.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 20, sizeof(sycl::half *), &O_ptr)),
++                opKernel, 20, sizeof(sycl::half *), &Offset)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ(
+-- 
+2.17.1
+

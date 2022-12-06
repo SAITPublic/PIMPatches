@@ -1,0 +1,348 @@
+From f246b66841d658e33b0ec2dbc3c8a1ac823ddd34 Mon Sep 17 00:00:00 2001
+From: Lukas Sommer <lukas.sommer@codeplay.com>
+Date: Thu, 23 Jun 2022 07:32:11 +0000
+Subject: [PATCH 07/17] [SYCL][PIM] Add rectangular copy/read/write for PIM to
+ HIP PI;
+
+---
+ sycl/plugins/hip/pi_hip.cpp                | 160 +++++++++++++++++----
+ sycl/unittests/pi/pim/test_pim_mem_obj.cpp |  85 +++++++++++
+ 2 files changed, 218 insertions(+), 27 deletions(-)
+
+diff --git a/sycl/plugins/hip/pi_hip.cpp b/sycl/plugins/hip/pi_hip.cpp
+index 77a0d736ce77..1f32430a3f2b 100644
+--- a/sycl/plugins/hip/pi_hip.cpp
++++ b/sycl/plugins/hip/pi_hip.cpp
+@@ -4776,6 +4776,72 @@ pi_result hip_piSamplerRelease(pi_sampler sampler) {
+   return PI_SUCCESS;
+ }
+ 
++/// General 3D memory copy operation for PIM.
++/// This function requires the corresponding HIP context to be at the top of
++/// the context stack
++/// If the source and/or destination is on the device, src_ptr and/or dst_ptr
++/// must be a pointer to a PimBo.
++static pi_result
++commonPIMCopyRect(pi_buff_rect_region region, const void *src_ptr,
++                  const PimMemType src_type, pi_buff_rect_offset src_offset,
++                  size_t src_row_pitch, size_t src_slice_pitch, void *dst_ptr,
++                  const PimMemType dst_type, pi_buff_rect_offset dst_offset,
++                  size_t dst_row_pitch, size_t dst_slice_pitch) {
++  assert(region != nullptr);
++  assert(src_ptr != nullptr && src_offset != nullptr);
++  assert(dst_ptr != nullptr && dst_offset != nullptr);
++
++  assert(src_type == MEM_TYPE_HOST || src_type == MEM_TYPE_PIM);
++  assert(dst_type == MEM_TYPE_HOST || dst_type == MEM_TYPE_PIM);
++
++  src_row_pitch = (!src_row_pitch) ? region->width_bytes : src_row_pitch;
++  src_slice_pitch = (!src_slice_pitch) ? (region->height_scalar * src_row_pitch)
++                                       : src_slice_pitch;
++  dst_row_pitch = (!dst_row_pitch) ? region->width_bytes : dst_row_pitch;
++  dst_slice_pitch = (!dst_slice_pitch) ? (region->height_scalar * dst_row_pitch)
++                                       : dst_slice_pitch;
++
++  PimCopy3D params;
++
++  params.WidthInBytes = region->width_bytes;
++  params.Height = region->height_scalar;
++  params.Depth = region->depth_scalar;
++
++  params.srcMemType = src_type;
++  params.srcXInBytes = src_offset->x_bytes;
++  params.srcY = src_offset->y_scalar;
++  params.srcZ = src_offset->z_scalar;
++  if (src_type == MEM_TYPE_PIM) {
++    params.srcPtr = nullptr;
++    params.srcPitch = 0;
++    params.srcHeight = 0;
++    params.srcBo = static_cast<const PimBo *>(src_ptr);
++  } else {
++    params.srcPtr = src_ptr;
++    params.srcPitch = src_row_pitch;
++    params.srcHeight = src_slice_pitch / src_row_pitch;
++    params.srcBo = nullptr;
++  }
++
++  params.dstMemType = dst_type;
++  params.dstXInBytes = dst_offset->x_bytes;
++  params.dstY = dst_offset->y_scalar;
++  params.dstZ = dst_offset->z_scalar;
++  if (dst_type == MEM_TYPE_PIM) {
++    params.dstPtr = nullptr;
++    params.dstPitch = 0;
++    params.dstHeight = 0;
++    params.dstBo = static_cast<PimBo *>(dst_ptr);
++  } else {
++    params.dstPtr = dst_ptr;
++    params.dstPitch = dst_row_pitch;
++    params.dstHeight = dst_slice_pitch / dst_row_pitch;
++    params.dstBo = nullptr;
++  }
++
++  return CHECK_PIM_ERROR(PimCopyMemoryRect(&params));
++}
++
+ /// General 3D memory copy operation.
+ /// This function requires the corresponding HIP context to be at the top of
+ /// the context stack
+@@ -4846,17 +4912,20 @@ pi_result hip_piEnqueueMemBufferReadRect(
+   assert(buffer != nullptr);
+   assert(command_queue != nullptr);
+ 
++  void *devPtr = nullptr;
+ #ifdef __HIP_ENABLE_PIM__
+   if (command_queue->device_->is_pim_device()) {
+-    // This function is currently not supported on PIM devices, because the PIM
+-    // SDK does not expose the corresponding API/functionality.
+-    return PI_INVALID_OPERATION;
++    assert(buffer->mem_type_ == _pi_mem::mem_type::pim);
++    devPtr = static_cast<void *>(buffer->mem_.pim_mem_.bo_);
++  } else {
++#endif // __HIP_ENABLE_PIM__
++    devPtr = buffer->mem_.buffer_mem_.get_void();
++#ifdef __HIP_ENABLE_PIM__
+   }
+ #endif // __HIP_ENABLE_PIM__
+ 
+   pi_result retErr = PI_SUCCESS;
+   hipStream_t hipStream = command_queue->get();
+-  void *devPtr = buffer->mem_.buffer_mem_.get_void();
+   std::unique_ptr<_pi_event> retImplEv{nullptr};
+ 
+   try {
+@@ -4870,11 +4939,21 @@ pi_result hip_piEnqueueMemBufferReadRect(
+           PI_COMMAND_TYPE_MEM_BUFFER_READ_RECT, command_queue));
+       retImplEv->start();
+     }
+-
+-    retErr = commonEnqueueMemBufferCopyRect(
+-        hipStream, region, &devPtr, hipMemoryTypeDevice, buffer_offset,
+-        buffer_row_pitch, buffer_slice_pitch, ptr, hipMemoryTypeHost,
+-        host_offset, host_row_pitch, host_slice_pitch);
++#ifdef __HIP_ENABLE_PIM__
++    if (command_queue->device_->is_pim_device()) {
++      retErr = commonPIMCopyRect(region, devPtr, MEM_TYPE_PIM, buffer_offset,
++                                 buffer_row_pitch, buffer_slice_pitch, ptr,
++                                 MEM_TYPE_HOST, host_offset, host_row_pitch,
++                                 host_slice_pitch);
++    } else {
++#endif // __HIP_ENABLE_PIM__
++      retErr = commonEnqueueMemBufferCopyRect(
++          hipStream, region, &devPtr, hipMemoryTypeDevice, buffer_offset,
++          buffer_row_pitch, buffer_slice_pitch, ptr, hipMemoryTypeHost,
++          host_offset, host_row_pitch, host_slice_pitch);
++#ifdef __HIP_ENABLE_PIM__
++    }
++#endif // __HIP_ENABLE_PIM__
+ 
+     if (event) {
+       retErr = retImplEv->record();
+@@ -4905,17 +4984,19 @@ pi_result hip_piEnqueueMemBufferWriteRect(
+   assert(buffer != nullptr);
+   assert(command_queue != nullptr);
+ 
++  void *devPtr = nullptr;
+ #ifdef __HIP_ENABLE_PIM__
+   if (command_queue->device_->is_pim_device()) {
+-    // This function is currently not supported on PIM devices, because the PIM
+-    // SDK does not expose the corresponding API/functionality.
+-    return PI_INVALID_OPERATION;
++    devPtr = static_cast<void *>(buffer->mem_.pim_mem_.bo_);
++  } else {
++#endif // __HIP_ENABLE_PIM__
++    devPtr = buffer->mem_.buffer_mem_.get_void();
++#ifdef __HIP_ENABLE_PIM__
+   }
+ #endif // __HIP_ENABLE_PIM__
+ 
+   pi_result retErr = PI_SUCCESS;
+   hipStream_t hipStream = command_queue->get();
+-  void *devPtr = buffer->mem_.buffer_mem_.get_void();
+   std::unique_ptr<_pi_event> retImplEv{nullptr};
+ 
+   try {
+@@ -4930,10 +5011,21 @@ pi_result hip_piEnqueueMemBufferWriteRect(
+       retImplEv->start();
+     }
+ 
+-    retErr = commonEnqueueMemBufferCopyRect(
+-        hipStream, region, ptr, hipMemoryTypeHost, host_offset, host_row_pitch,
+-        host_slice_pitch, &devPtr, hipMemoryTypeDevice, buffer_offset,
+-        buffer_row_pitch, buffer_slice_pitch);
++#ifdef __HIP_ENABLE_PIM__
++    if (command_queue->device_->is_pim_device()) {
++      retErr = commonPIMCopyRect(region, ptr, MEM_TYPE_HOST, host_offset,
++                                 host_row_pitch, host_slice_pitch, devPtr,
++                                 MEM_TYPE_PIM, buffer_offset, buffer_row_pitch,
++                                 buffer_slice_pitch);
++    } else {
++#endif // __HIP_ENABLE_PIM__
++      retErr = commonEnqueueMemBufferCopyRect(
++          hipStream, region, ptr, hipMemoryTypeHost, host_offset,
++          host_row_pitch, host_slice_pitch, &devPtr, hipMemoryTypeDevice,
++          buffer_offset, buffer_row_pitch, buffer_slice_pitch);
++#ifdef __HIP_ENABLE_PIM__
++    }
++#endif // __HIP_ENABLE_PIM__
+ 
+     if (event) {
+       retErr = retImplEv->record();
+@@ -4946,7 +5038,6 @@ pi_result hip_piEnqueueMemBufferWriteRect(
+     if (event) {
+       *event = retImplEv.release();
+     }
+-
+   } catch (pi_result err) {
+     retErr = err;
+   }
+@@ -5028,18 +5119,22 @@ pi_result hip_piEnqueueMemBufferCopyRect(
+   assert(dst_buffer != nullptr);
+   assert(command_queue != nullptr);
+ 
++  void *srcPtr = nullptr;
++  void *dstPtr = nullptr;
+ #ifdef __HIP_ENABLE_PIM__
+   if (command_queue->device_->is_pim_device()) {
+-    // This function is currently not supported on PIM devices, because the PIM
+-    // SDK does not expose the corresponding API/functionality.
+-    return PI_INVALID_OPERATION;
++    srcPtr = static_cast<void *>(src_buffer->mem_.pim_mem_.bo_);
++    dstPtr = static_cast<void *>(dst_buffer->mem_.pim_mem_.bo_);
++  } else {
++#endif // __HIP_ENABLE_PIM__
++    srcPtr = src_buffer->mem_.buffer_mem_.get_void();
++    dstPtr = dst_buffer->mem_.buffer_mem_.get_void();
++#ifdef __HIP_ENABLE_PIM__
+   }
+ #endif // __HIP_ENABLE_PIM__
+ 
+   pi_result retErr = PI_SUCCESS;
+   hipStream_t hipStream = command_queue->get();
+-  void *srcPtr = src_buffer->mem_.buffer_mem_.get_void();
+-  void *dstPtr = dst_buffer->mem_.buffer_mem_.get_void();
+   std::unique_ptr<_pi_event> retImplEv{nullptr};
+ 
+   try {
+@@ -5054,10 +5149,21 @@ pi_result hip_piEnqueueMemBufferCopyRect(
+       retImplEv->start();
+     }
+ 
+-    retErr = commonEnqueueMemBufferCopyRect(
+-        hipStream, region, &srcPtr, hipMemoryTypeDevice, src_origin,
+-        src_row_pitch, src_slice_pitch, &dstPtr, hipMemoryTypeDevice,
+-        dst_origin, dst_row_pitch, dst_slice_pitch);
++#ifdef __HIP_ENABLE_PIM__
++    if (command_queue->device_->is_pim_device()) {
++      retErr = commonPIMCopyRect(region, srcPtr, MEM_TYPE_PIM, src_origin,
++                                 src_row_pitch, src_slice_pitch, dstPtr,
++                                 MEM_TYPE_PIM, dst_origin, dst_row_pitch,
++                                 dst_slice_pitch);
++    } else {
++#endif // __HIP_ENABLE_PIM__
++      retErr = commonEnqueueMemBufferCopyRect(
++          hipStream, region, &srcPtr, hipMemoryTypeDevice, src_origin,
++          src_row_pitch, src_slice_pitch, &dstPtr, hipMemoryTypeDevice,
++          dst_origin, dst_row_pitch, dst_slice_pitch);
++#ifdef __HIP_ENABLE_PIM__
++    }
++#endif // __HIP_ENABLE_PIM__
+ 
+     if (event) {
+       retImplEv->record();
+diff --git a/sycl/unittests/pi/pim/test_pim_mem_obj.cpp b/sycl/unittests/pi/pim/test_pim_mem_obj.cpp
+index 1a8b435cc370..10f75ccb409e 100644
+--- a/sycl/unittests/pi/pim/test_pim_mem_obj.cpp
++++ b/sycl/unittests/pi/pim/test_pim_mem_obj.cpp
+@@ -389,3 +389,88 @@ TEST_F(PimTestMemObj, piMemBufferMapForWrite) {
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(memObj)),
+             PI_SUCCESS);
+ }
++
++TEST_F(PimTestMemObj, piCommonPIMCopyRect) {
++  constexpr size_t numElements = 4;
++  constexpr size_t memSize = numElements * numElements * sizeof(sycl::half);
++
++  std::array<sycl::half, numElements *numElements> hostData = {
++      42, 42, 1, 1, 42, 42, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
++
++  std::array<pi_mem_properties, 9> memProperties = {
++      PI_MEM_PROPERTIES_PIM_DIMENSIONS,
++      numElements,
++      numElements,
++      1,
++      PI_MEM_PROPERTIES_PIM_MEM_FLAG,
++      pi_pim_mem_flag::PI_PIM_ELT_OP,
++      PI_MEM_PROPERTIES_PIM_OP_TYPE,
++      pi_pim_op_type::PI_PIM_OP_ELT_ADD,
++      0};
++
++  pi_mem buf1;
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
++                context_, PI_MEM_FLAGS_ACCESS_RW, memSize, nullptr, &buf1,
++                memProperties.data())),
++            PI_SUCCESS);
++
++  constexpr size_t regionSize = 2;
++  constexpr size_t rowPitch = numElements * sizeof(sycl::half);
++  constexpr size_t slicePitch = numElements * numElements * sizeof(sycl::half);
++  // Write upper left 2x2 square of host data to the lower right square of the
++  // device buffer.
++  pi_buff_rect_offset_struct buf1Offset{regionSize * sizeof(sycl::half),
++                                        regionSize, 0};
++  pi_buff_rect_offset_struct hostInOffset{0, 0, 0};
++  pi_buff_rect_region_struct region{regionSize * sizeof(sycl::half), regionSize,
++                                    1};
++  ASSERT_EQ(
++      plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferWriteRect>(
++          queue_, buf1, true, &buf1Offset, &hostInOffset, &region, rowPitch,
++          slicePitch, rowPitch, slicePitch, hostData.data(), 0, nullptr,
++          nullptr),
++      PI_SUCCESS);
++
++  pi_mem buf2;
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
++                context_, PI_MEM_FLAGS_ACCESS_RW, memSize, nullptr, &buf2,
++                memProperties.data())),
++            PI_SUCCESS);
++
++  // Copy the lower right square of the first device buffer to the lower left
++  // square of the second device buffer.
++  pi_buff_rect_offset_struct buf2Offset{0, regionSize, 0};
++  ASSERT_EQ(
++      (plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferCopyRect>(
++          queue_, buf1, buf2, &buf1Offset, &buf2Offset, &region, rowPitch,
++          slicePitch, rowPitch, slicePitch, 0, nullptr, nullptr)),
++      PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(buf1)),
++            PI_SUCCESS);
++
++  // Read the lower left square of the second device buffer to the upper right
++  // square of the host data.
++  pi_buff_rect_offset_struct hostOutOffset{regionSize * sizeof(sycl::half), 0,
++                                           0};
++  ASSERT_EQ(
++      (plugin->call_nocheck<detail::PiApiKind::piEnqueueMemBufferReadRect>(
++          queue_, buf2, true, &buf2Offset, &hostOutOffset, &region, rowPitch,
++          slicePitch, rowPitch, slicePitch, hostData.data(), 0, nullptr,
++          nullptr)),
++      PI_SUCCESS);
++
++  for (size_t i = 0; i < numElements; ++i) {
++    for (size_t j = 0; j < numElements; ++j) {
++      if (i < regionSize) {
++        ASSERT_EQ(hostData[i * numElements + j], static_cast<sycl::half>(42));
++      } else {
++        ASSERT_EQ(hostData[i * numElements + j], static_cast<sycl::half>(1));
++      }
++    }
++  }
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemRelease>(buf2)),
++            PI_SUCCESS);
++}
+-- 
+2.17.1
+

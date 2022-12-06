@@ -1,0 +1,277 @@
+From 894d109d11a7971d408104bfb40d809be45db9d8 Mon Sep 17 00:00:00 2001
+From: Lukas Sommer <lukas.sommer@codeplay.com>
+Date: Wed, 29 Jun 2022 12:40:46 +0100
+Subject: [PATCH 09/17] [SYCL][PIM] Add support for PIM ops on host device
+
+---
+ sycl/cmake/modules/AddSYCLUnitTest.cmake  |  13 +++
+ sycl/source/CMakeLists.txt                |  19 +++
+ sycl/source/detail/queue_impl.hpp         |   4 +-
+ sycl/source/detail/scheduler/commands.cpp | 135 ++++++++++++++++++++++
+ sycl/source/detail/scheduler/commands.hpp |   4 +
+ 5 files changed, 173 insertions(+), 2 deletions(-)
+
+diff --git a/sycl/cmake/modules/AddSYCLUnitTest.cmake b/sycl/cmake/modules/AddSYCLUnitTest.cmake
+index 9f5e6dc30a48..5dbb1ae83671 100644
+--- a/sycl/cmake/modules/AddSYCLUnitTest.cmake
++++ b/sycl/cmake/modules/AddSYCLUnitTest.cmake
+@@ -3,6 +3,12 @@
+ # Will compile the list of files together and link against SYCL.
+ # Produces a binary names `basename(test_dirname)`.
+ macro(add_sycl_unittest test_dirname link_variant)
++  if(SYCL_ENABLE_PIM)
++    # The PIM mock-up library is used for host-fallback implementation
++    # of PIM operations.
++    find_package(PIMMock REQUIRED
++      PATHS "${SYCL_BUILD_PIM_MOCK_DIR}")
++  endif(SYCL_ENABLE_PIM)
+   # Enable exception handling for these unit tests
+   set(LLVM_REQUIRES_EH ON)
+   set(LLVM_REQUIRES_RTTI ON)
+@@ -56,6 +62,13 @@ macro(add_sycl_unittest test_dirname link_variant)
+       OpenCL-Headers
+       ${SYCL_LINK_LIBS}
+     )
++
++  if(SYCL_ENABLE_PIM)
++    # Link the PIM mock-up library for host fallback
++    # implementation of PIM operations.
++    target_link_libraries(${test_dirname} PRIVATE PIMMock)
++  endif(SYCL_ENABLE_PIM)
++  
+   target_include_directories(${test_dirname}
+     PRIVATE SYSTEM
+       ${sycl_inc_dir}
+diff --git a/sycl/source/CMakeLists.txt b/sycl/source/CMakeLists.txt
+index 4b7f1a881645..185ec4f0f714 100644
+--- a/sycl/source/CMakeLists.txt
++++ b/sycl/source/CMakeLists.txt
+@@ -16,6 +16,18 @@ if (SYCL_ENABLE_XPTI_TRACING)
+   include_directories(${LLVM_EXTERNAL_XPTI_SOURCE_DIR}/include)
+ endif()
+ 
++# The following variable can be set by the user to provide the location
++# of the PIM mock-up library
++set(SYCL_BUILD_PIM_MOCK_DIR "/opt/rocm/pim" CACHE STRING
++  "Directory containing the PIM mock-up library")
++
++if(SYCL_ENABLE_PIM)
++  # The PIM mock-up library is used for host-fallback implementation
++  # of PIM operations.
++  find_package(PIMMock REQUIRED
++                PATHS "${SYCL_BUILD_PIM_MOCK_DIR}")
++endif(SYCL_ENABLE_PIM)
++  
+ function(add_sycl_rt_library LIB_NAME)
+   # Add an optional argument so we can get the library name to
+   # link with for Windows Debug version
+@@ -91,6 +103,13 @@ function(add_sycl_rt_library LIB_NAME)
+     PRIVATE OpenCL-Headers
+   )
+ 
++  if(SYCL_ENABLE_PIM)
++    # Link the PIM mock-up library for host fallback 
++    # implementation of PIM operations.
++    target_link_libraries(${LIB_NAME} PRIVATE PIMMock)
++    target_link_libraries(${LIB_OBJ_NAME} PRIVATE PIMMock)
++  endif(SYCL_ENABLE_PIM)
++
+   find_package(Threads REQUIRED)
+ 
+   target_link_libraries(${LIB_NAME}
+diff --git a/sycl/source/detail/queue_impl.hpp b/sycl/source/detail/queue_impl.hpp
+index 52e2c09c27dc..30e77f6f0333 100644
+--- a/sycl/source/detail/queue_impl.hpp
++++ b/sycl/source/detail/queue_impl.hpp
+@@ -585,11 +585,11 @@ private:
+     Handler.saveCodeLoc(Loc);
+     CGF(Handler);
+ 
+-    if (!this->get_device().has(aspect::ext_samsung_pim)) {
++    if (!this->get_device().has(aspect::ext_samsung_pim) && !this->is_host()) {
+       throw sycl::exception(
+           sycl::make_error_code(sycl::errc::feature_not_supported),
+           "ext::samsung::pim_handler only supported on queues backed by device "
+-          "with aspect::ext:samsung_pim");
++          "with aspect::ext:samsung_pim or on the host device");
+     }
+ 
+     // At the time of writing, the post-processing seems to be used for kernels
+diff --git a/sycl/source/detail/scheduler/commands.cpp b/sycl/source/detail/scheduler/commands.cpp
+index 496be3770efc..1663490f203a 100644
+--- a/sycl/source/detail/scheduler/commands.cpp
++++ b/sycl/source/detail/scheduler/commands.cpp
+@@ -49,6 +49,10 @@
+ #include <detail/xpti_registry.hpp>
+ #endif
+ 
++#if SYCL_EXT_SAMSUNG_PIM
++#include "pim_runtime_api.h"
++#endif // SYCL_EXT_SAMSUNG_PIM
++
+ __SYCL_INLINE_NAMESPACE(cl) {
+ namespace sycl {
+ namespace detail {
+@@ -2564,6 +2568,22 @@ cl_int ExecCGCommand::enqueueImp() {
+       AllocaCommandBase *AllocaCmd = getAllocaForReq(Req);
+       return AllocaCmd->getMemAllocation();
+     };
++
++    if (MQueue->is_host()) {
++      if (!RawEvents.empty()) {
++        // Assuming that the events are for devices to the same plugin.
++        const detail::plugin &Plugin = EventImpls[0]->getPlugin();
++        Plugin.call<PiApiKind::piEventsWait>(RawEvents.size(),
++                                             RawEvents.data());
++      }
++
++      auto Result = LaunchPimOperationOnHost(ExecPim->MArgs, ExecPim->MOp,
++                                             getMemAllocationFunc);
++      if (Result != PI_SUCCESS) {
++        return CL_INVALID_OPERATION;
++      }
++      return CL_SUCCESS;
++    }
+     return LaunchPimOperation(MQueue, ExecPim->MArgs, ExecPim->MOp, RawEvents,
+                               &MEvent->getHandleRef(), getMemAllocationFunc);
+   }
+@@ -2718,6 +2738,121 @@ std::string ExecCGCommand::translatePimOpType(CGPim::PIM_OPERATION Op) {
+   }
+ }
+ 
++namespace {
++
++PimBo *createPIMBufferFromArgs(
++    std::vector<ArgDesc> &Args, size_t &ArgIndex,
++    const std::function<void *(Requirement *Req)> &getMemAllocationFunc) {
++  auto MemArg = Args[ArgIndex++];
++  assert(MemArg.MType == kernel_param_kind_t::kind_accessor);
++  auto *Req = static_cast<Requirement *>(MemArg.MPtr);
++  auto *BufferPtr = getMemAllocationFunc(Req);
++  auto BufferRange = detail::convertRangeToXYZ(Req->MMemoryRange, Req->MDims);
++  assert(Args[ArgIndex].MType == kernel_param_kind_t::kind_std_layout);
++  size_t XRange = *static_cast<size_t *>(Args[ArgIndex++].MPtr);
++  assert(Args[ArgIndex].MType == kernel_param_kind_t::kind_std_layout);
++  size_t YRange = *static_cast<size_t *>(Args[ArgIndex++].MPtr);
++  assert(Args[ArgIndex].MType == kernel_param_kind_t::kind_std_layout);
++  size_t ZRange = *static_cast<size_t *>(Args[ArgIndex++].MPtr);
++  assert(Args[ArgIndex].MType == kernel_param_kind_t::kind_std_layout);
++  size_t XOffset = *static_cast<size_t *>(Args[ArgIndex++].MPtr);
++  assert(Args[ArgIndex].MType == kernel_param_kind_t::kind_std_layout);
++  size_t YOffset = *static_cast<size_t *>(Args[ArgIndex++].MPtr);
++  assert(Args[ArgIndex].MType == kernel_param_kind_t::kind_std_layout);
++  size_t ZOffset = *static_cast<size_t *>(Args[ArgIndex++].MPtr);
++
++  // Calculate an offset pointer into the original buffer.
++  auto offset = (ZOffset * BufferRange[1] + YOffset) * BufferRange[0] + XOffset;
++  void *OffsetPointer = static_cast<void *>(static_cast<char *>(BufferPtr) +
++                                            offset * /* sizeof(FP16)*/ 2);
++  // Create a PIM buffer object with size taken from the accessor range.
++  return PimCreateBo(XRange, YRange, ZRange, 1, PIM_FP16, MEM_TYPE_HOST,
++                     OffsetPointer);
++}
++
++template <typename T>
++T getScalarFromArgs(std::vector<ArgDesc> &Args, size_t &ArgIndex) {
++  auto ScalarArg = Args[ArgIndex++];
++  assert(ScalarArg.MType == kernel_param_kind_t::kind_std_layout);
++  return *static_cast<T *>(ScalarArg.MPtr);
++}
++
++using PimVectorOpT =
++    std::function<int(PimBo *, PimBo *, PimBo *, void *, bool)>;
++using PimVectorOpPtr = int (*)(PimBo *, PimBo *, PimBo *, void *, bool);
++
++using PimScalarOpT = std::function<int(PimBo *, void *, PimBo *, void *, bool)>;
++using PimScalarOpPtr = int (*)(PimBo *, void *, PimBo *, void *, bool);
++
++pi_result launchPIMVectorOpOnHost(
++    std::vector<ArgDesc> &Args,
++    const std::function<void *(Requirement *Req)> &getMemAllocationFunc,
++    PimVectorOpT Operation) {
++  size_t ArgIndex = 0;
++  auto *OutputBuffer =
++      createPIMBufferFromArgs(Args, ArgIndex, getMemAllocationFunc);
++  auto *Operand0Buffer =
++      createPIMBufferFromArgs(Args, ArgIndex, getMemAllocationFunc);
++  auto *Operand1Buffer =
++      createPIMBufferFromArgs(Args, ArgIndex, getMemAllocationFunc);
++  auto OpResult = Operation(OutputBuffer, Operand0Buffer, Operand1Buffer,
++                            /* stream */ nullptr,
++                            /* blocking */ true);
++  PimDestroyBo(OutputBuffer);
++  PimDestroyBo(Operand0Buffer);
++  PimDestroyBo(Operand1Buffer);
++  if (OpResult != 0) {
++    return PI_PIM_SDK_ERROR;
++  }
++  return PI_SUCCESS;
++}
++
++pi_result launchPIMScalarOpOnHost(
++    std::vector<ArgDesc> &Args,
++    const std::function<void *(Requirement *Req)> &getMemAllocationFunc,
++    PimScalarOpT Operation) {
++  size_t ArgIndex = 0;
++  auto *OutputBuffer =
++      createPIMBufferFromArgs(Args, ArgIndex, getMemAllocationFunc);
++  sycl::half ScalarArg = getScalarFromArgs<sycl::half>(Args, ArgIndex);
++  auto *VectorBuffer =
++      createPIMBufferFromArgs(Args, ArgIndex, getMemAllocationFunc);
++  auto OpResult = Operation(OutputBuffer, &ScalarArg, VectorBuffer,
++                            /* stream */ nullptr, /* blocking */ true);
++  PimDestroyBo(OutputBuffer);
++  PimDestroyBo(VectorBuffer);
++  if (OpResult != 0) {
++    return PI_PIM_SDK_ERROR;
++  }
++  return PI_SUCCESS;
++}
++
++} // anonymous namespace
++
++pi_result ExecCGCommand::LaunchPimOperationOnHost(
++    std::vector<ArgDesc> &Args, CGPim::PIM_OPERATION Op,
++    const std::function<void *(Requirement *Req)> &getMemAllocationFunc) {
++  switch (Op) {
++  case CGPim::PIM_OPERATION::ELT_VEC_ADD:
++    return launchPIMVectorOpOnHost(Args, getMemAllocationFunc,
++                                   static_cast<PimVectorOpPtr>(PimExecuteAdd));
++  case CGPim::PIM_OPERATION::ELT_SCALAR_ADD:
++    return launchPIMScalarOpOnHost(Args, getMemAllocationFunc,
++                                   static_cast<PimScalarOpPtr>(PimExecuteAdd));
++  case CGPim::PIM_OPERATION::ELT_VEC_MUL:
++    return launchPIMVectorOpOnHost(Args, getMemAllocationFunc,
++                                   static_cast<PimVectorOpPtr>(PimExecuteMul));
++  case CGPim::PIM_OPERATION::ELT_SCALAR_MUL:
++    return launchPIMScalarOpOnHost(Args, getMemAllocationFunc,
++                                   static_cast<PimScalarOpPtr>(PimExecuteMul));
++  case CGPim::PIM_OPERATION::GEMV:
++    return launchPIMVectorOpOnHost(Args, getMemAllocationFunc,
++                                   static_cast<PimVectorOpPtr>(PimExecuteGemv));
++  default:
++    return PI_INVALID_OPERATION;
++  }
++}
++
+ } // namespace detail
+ } // namespace sycl
+ } // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/source/detail/scheduler/commands.hpp b/sycl/source/detail/scheduler/commands.hpp
+index ded6cacabf23..2d60cc338e4e 100644
+--- a/sycl/source/detail/scheduler/commands.hpp
++++ b/sycl/source/detail/scheduler/commands.hpp
+@@ -572,6 +572,10 @@ private:
+       RT::PiEvent *OutEvent,
+       const std::function<void *(Requirement *Req)> &getMemAllocationFunc);
+ 
++  pi_result LaunchPimOperationOnHost(
++      std::vector<ArgDesc> &Args, CGPim::PIM_OPERATION Op,
++      const std::function<void *(Requirement *Req)> &getMemAllocationFunc);
++
+   std::string translatePimOpType(CGPim::PIM_OPERATION Op);
+ 
+   std::unique_ptr<detail::CG> MCommandGroup;
+-- 
+2.17.1
+

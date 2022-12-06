@@ -1,0 +1,625 @@
+From 371842f667da04e6dfe3f4dd65b91a104aa8da74 Mon Sep 17 00:00:00 2001
+From: Lukas Sommer <lukas.sommer@codeplay.com>
+Date: Fri, 17 Jun 2022 14:45:23 +0000
+Subject: [PATCH 04/17] [SYCL][PIM] Implement infrastructure for pim_handler;
+
+Adds basic infrastructure, including device aspects
+for PIM, and the basic definition of the `pim_handler`.
+
+Allows to submit command-group functions taking a
+`pim_handler` as parameter to `queue::submit`.
+---
+ sycl/CMakeLists.txt                           |   3 +
+ sycl/include/CL/sycl.hpp                      |   3 +
+ sycl/include/CL/sycl/aspects.hpp              |   1 +
+ sycl/include/CL/sycl/detail/cg.hpp            |   1 +
+ sycl/include/CL/sycl/feature_test.hpp.in      |   4 +
+ sycl/include/CL/sycl/queue.hpp                |  15 +-
+ .../sycl/ext/samsung/pim/pim_handler.hpp      | 135 ++++++++++++++++++
+ sycl/plugins/hip/CMakeLists.txt               |   2 +-
+ sycl/source/CMakeLists.txt                    |   1 +
+ sycl/source/detail/device_impl.cpp            |   2 +
+ sycl/source/detail/queue_impl.hpp             | 101 +++++++++++--
+ sycl/source/detail/scheduler/commands.cpp     |   3 +-
+ sycl/source/handler.cpp                       |   4 +
+ sycl/source/pim_handler.cpp                   |  60 ++++++++
+ sycl/source/queue.cpp                         |  14 +-
+ sycl/test/basic_tests/stream/byte.cpp         |   5 +-
+ 16 files changed, 339 insertions(+), 15 deletions(-)
+ create mode 100644 sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
+ create mode 100644 sycl/source/pim_handler.cpp
+
+diff --git a/sycl/CMakeLists.txt b/sycl/CMakeLists.txt
+index 061677055d1e..66a82518a126 100644
+--- a/sycl/CMakeLists.txt
++++ b/sycl/CMakeLists.txt
+@@ -138,6 +138,9 @@ install(DIRECTORY ${OpenCL_INCLUDE_DIR}/CL
+         DESTINATION ${SYCL_INCLUDE_DIR}/sycl
+         COMPONENT OpenCL-Headers)
+ 
++# Add an option to enable PIM support
++option(SYCL_ENABLE_PIM "Enable support for processing-in-memory" ON)
++
+ # Needed for feature_test.hpp
+ if ("cuda" IN_LIST SYCL_ENABLE_PLUGINS)
+   set(SYCL_BUILD_PI_CUDA ON)
+diff --git a/sycl/include/CL/sycl.hpp b/sycl/include/CL/sycl.hpp
+index 8ca7d28223ca..ca5a0e040ce6 100644
+--- a/sycl/include/CL/sycl.hpp
++++ b/sycl/include/CL/sycl.hpp
+@@ -71,3 +71,6 @@
+ #include <sycl/ext/oneapi/reduction.hpp>
+ #include <sycl/ext/oneapi/sub_group.hpp>
+ #include <sycl/ext/oneapi/sub_group_mask.hpp>
++#if SYCL_EXT_SAMSUNG_PIM
++#include <sycl/ext/samsung/pim/pim_handler.hpp>
++#endif
+diff --git a/sycl/include/CL/sycl/aspects.hpp b/sycl/include/CL/sycl/aspects.hpp
+index 5b5d16175977..e625781927c9 100644
+--- a/sycl/include/CL/sycl/aspects.hpp
++++ b/sycl/include/CL/sycl/aspects.hpp
+@@ -49,6 +49,7 @@ enum class aspect {
+   ext_oneapi_native_assert = 31,
+   host_debuggable = 32,
+   ext_intel_gpu_hw_threads_per_eu = 33,
++  ext_samsung_pim = 34,
+ };
+ 
+ } // namespace sycl
+diff --git a/sycl/include/CL/sycl/detail/cg.hpp b/sycl/include/CL/sycl/detail/cg.hpp
+index ba70ddefcee2..c8d685f3a167 100644
+--- a/sycl/include/CL/sycl/detail/cg.hpp
++++ b/sycl/include/CL/sycl/detail/cg.hpp
+@@ -170,6 +170,7 @@ public:
+     CodeplayInteropTask = 13,
+     CodeplayHostTask = 14,
+     AdviseUSM = 15,
++    PIMOp = 16,
+   };
+ 
+   CG(CGTYPE Type, std::vector<std::vector<char>> ArgsStorage,
+diff --git a/sycl/include/CL/sycl/feature_test.hpp.in b/sycl/include/CL/sycl/feature_test.hpp.in
+index 94e0447a8e0e..ca295e58bbff 100644
+--- a/sycl/include/CL/sycl/feature_test.hpp.in
++++ b/sycl/include/CL/sycl/feature_test.hpp.in
+@@ -83,6 +83,10 @@ namespace sycl {
+ #if SYCL_BUILD_PI_HIP
+ #define SYCL_EXT_ONEAPI_BACKEND_HIP 1
+ #endif
++#cmakedefine01 SYCL_ENABLE_PIM
++#if SYCL_ENABLE_PIM
++#define SYCL_EXT_SAMSUNG_PIM 1
++#endif
+ 
+ } // namespace sycl
+ } // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/include/CL/sycl/queue.hpp b/sycl/include/CL/sycl/queue.hpp
+index 501b4fe61b5b..212db7207210 100644
+--- a/sycl/include/CL/sycl/queue.hpp
++++ b/sycl/include/CL/sycl/queue.hpp
+@@ -17,11 +17,14 @@
+ #include <CL/sycl/device_selector.hpp>
+ #include <CL/sycl/event.hpp>
+ #include <CL/sycl/exception_list.hpp>
++#include <CL/sycl/feature_test.hpp>
+ #include <CL/sycl/handler.hpp>
+ #include <CL/sycl/info/info_desc.hpp>
+ #include <CL/sycl/property_list.hpp>
+ #include <CL/sycl/stl.hpp>
+-
++#if SYCL_EXT_SAMSUNG_PIM
++#include <sycl/ext/samsung/pim/pim_handler.hpp>
++#endif // SYCL_EXT_SAMSUNG_PIM
+ // Explicitly request format macros
+ #ifndef __STDC_FORMAT_MACROS
+ #define __STDC_FORMAT_MACROS 1
+@@ -1086,6 +1089,16 @@ private:
+   event submit_impl(std::function<void(handler &)> CGH, queue secondQueue,
+                     const detail::code_location &CodeLoc);
+ 
++#if SYCL_EXT_SAMSUNG_PIM
++  /// A template-free version of submit for PIM.
++  event submit_impl(std::function<void(ext::samsung::pim_handler &)> CGH,
++                    const detail::code_location &CodeLoc);
++
++  /// A template-free version of submit for PIM.
++  event submit_impl(std::function<void(ext::samsung::pim_handler &)> CGH,
++                    queue secondQueue, const detail::code_location &CodeLoc);
++#endif // SYCL_EXT_SAMSUNG_PIM
++
+   /// Checks if the event needs to be discarded and if so, discards it and
+   /// returns a discarded event. Otherwise, it returns input event.
+   event discard_or_return(const event &Event);
+diff --git a/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp b/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
+new file mode 100644
+index 000000000000..a06283062ed7
+--- /dev/null
++++ b/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
+@@ -0,0 +1,135 @@
++//==--- pim_handler.hpp --- SYCL command group handler for PIM operations --==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++#pragma once
++
++#include <CL/sycl/access/access.hpp>
++#include <CL/sycl/event.hpp>
++
++__SYCL_INLINE_NAMESPACE(cl) {
++namespace sycl {
++namespace detail {
++class queue_impl;
++using EventImplPtr = std::shared_ptr<detail::event_impl>;
++} // namespace detail
++namespace ext {
++namespace samsung {
++
++// Forward declaration.
++template <typename DataT, int Dimensions, access_mode AccessMode>
++class pim_accessor;
++
++class pim_handler {
++
++private:
++  pim_handler(std::shared_ptr<detail::queue_impl> Queue);
++
++  /// Saves the location of user's code passed in \param CodeLoc for future
++  /// usage in finalize() method.
++  void saveCodeLoc(detail::code_location CodeLoc) { MCodeLoc = CodeLoc; }
++
++  /// Constructs CG object of specific type, passes it to Scheduler and
++  /// returns sycl::event object representing the command group.
++  /// It's expected that the method is the latest method executed before
++  /// object destruction.
++  ///
++  /// \return a SYCL event object representing the command group
++  event finalize();
++
++public:
++  pim_handler(const pim_handler &) = delete;
++  pim_handler(pim_handler &&) = delete;
++  pim_handler &operator=(const pim_handler &) = delete;
++  pim_handler &operator=(pim_handler &&) = delete;
++
++  /// Registers event dependencies on this command group.
++  ///
++  /// \param Event is a valid SYCL event to wait on.
++  void depends_on(event Event);
++
++  /// Registers event dependencies on this command group.
++  ///
++  /// \param Events is a vector of valid SYCL events to wait on.
++  void depends_on(const std::vector<event> &Events);
++
++  template <typename DataT, int Dimensions, access_mode OutMode,
++            access_mode Op0Mode, access_mode Op1Mode>
++  void elementwise_add(pim_accessor<DataT, Dimensions, OutMode> output,
++                       pim_accessor<DataT, Dimensions, Op0Mode> operand0,
++                       pim_accessor<DataT, Dimensions, Op1Mode> operand1);
++
++  template <typename DataT, int Dimensions, access_mode OutMode,
++            access_mode VecMode>
++  void elementwise_add(pim_accessor<DataT, Dimensions, OutMode> output,
++                       DataT scalar,
++                       pim_accessor<DataT, Dimensions, VecMode> vec);
++
++  template <typename DataT, int Dimensions, access_mode OutMode,
++            access_mode Op0Mode, access_mode Op1Mode>
++  void elementwise_mul(pim_accessor<DataT, Dimensions, OutMode> output,
++                       pim_accessor<DataT, Dimensions, Op0Mode> operand0,
++                       pim_accessor<DataT, Dimensions, Op1Mode> operand1);
++
++  template <typename DataT, int Dimensions, access_mode OutMode,
++            access_mode VecMode>
++  void elementwise_mul(pim_accessor<DataT, Dimensions, OutMode> output,
++                       DataT scalar,
++                       pim_accessor<DataT, Dimensions, VecMode> vec);
++
++  template <typename DataT, int Dimensions, access_mode OutMode,
++            access_mode InMode>
++  void relu(pim_accessor<DataT, Dimensions, OutMode> output,
++            pim_accessor<DataT, Dimensions, InMode> input);
++
++  template <typename DataT, int OutDim, access_mode OutMode, int VecDim,
++            access_mode VecMode, int MatDim, access_mode MatMode>
++  void gemv(pim_accessor<DataT, OutDim, OutMode> output,
++            pim_accessor<DataT, VecDim, VecMode> vec,
++            pim_accessor<DataT, MatDim, MatMode> matrix);
++
++  template <typename DataT, int OutDim, access_mode OutMode, int VecDim,
++            access_mode VecMode, int MatDim, access_mode MatMode>
++  void gemv_add(pim_accessor<DataT, OutDim, OutMode> output,
++                pim_accessor<DataT, VecDim, VecMode> vec,
++                pim_accessor<DataT, MatDim, MatMode> matrix);
++
++  template <typename DataT, int OutDim, access_mode OutMode, int VecDim,
++            access_mode VecMode, int MatDim, access_mode MatMode, int AddDim,
++            access_mode AddMode>
++  void gemv_add(pim_accessor<DataT, OutDim, OutMode> output,
++                pim_accessor<DataT, VecDim, VecMode> vec,
++                pim_accessor<DataT, MatDim, MatMode> matrix,
++                pim_accessor<DataT, AddDim, AddMode> addIn, bool fuseRelu);
++
++  template <typename DataT, int DataDim, access_mode OutMode,
++            access_mode InMode, int ValDim, access_mode BetaMode,
++            access_mode GammaMode, access_mode MeanMode,
++            access_mode VarianceMode>
++  void batch_norm(pim_accessor<DataT, DataDim, OutMode> output,
++                  pim_accessor<DataT, DataDim, InMode> input,
++                  pim_accessor<DataT, ValDim, BetaMode> beta,
++                  pim_accessor<DataT, ValDim, GammaMode> gamma,
++                  pim_accessor<DataT, ValDim, MeanMode> mean,
++                  pim_accessor<DataT, ValDim, VarianceMode> variance,
++                  DataT epsilon);
++
++private:
++  std::shared_ptr<detail::queue_impl> MQueue;
++
++  /// The list of events that order this operation.
++  std::vector<detail::EventImplPtr> MEvents;
++
++  detail::code_location MCodeLoc;
++
++  // Make a friend to allow calling private constructors.
++  friend detail::queue_impl;
++};
++
++} // namespace samsung
++} // namespace ext
++} // namespace sycl
++} // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/plugins/hip/CMakeLists.txt b/sycl/plugins/hip/CMakeLists.txt
+index c2f0ba4ba9c3..811951d31641 100644
+--- a/sycl/plugins/hip/CMakeLists.txt
++++ b/sycl/plugins/hip/CMakeLists.txt
+@@ -90,7 +90,7 @@ endif()
+ # development on Nvidia GPUs.
+ # TODO(Lukas) Evaluate on AMD only, because there's no Nvidia device 
+ # with Samsung PIM.
+-if(SYCL_HIP_PI_ENABLE_PIM)
++if(SYCL_ENABLE_PIM AND SYCL_HIP_PI_ENABLE_PIM)
+   target_compile_definitions(pi_hip PRIVATE __HIP_ENABLE_PIM__)
+ 
+   # Additional compile definitions for development purposes.
+diff --git a/sycl/source/CMakeLists.txt b/sycl/source/CMakeLists.txt
+index 5f23d77b1126..4b7f1a881645 100644
+--- a/sycl/source/CMakeLists.txt
++++ b/sycl/source/CMakeLists.txt
+@@ -182,6 +182,7 @@ set(SYCL_SOURCES
+     "interop_handler.cpp"
+     "kernel.cpp"
+     "kernel_bundle.cpp"
++    "pim_handler.cpp"
+     "platform.cpp"
+     "program.cpp"
+     "queue.cpp"
+diff --git a/sycl/source/detail/device_impl.cpp b/sycl/source/detail/device_impl.cpp
+index bd66022b5240..2cbb2b1d0a52 100644
+--- a/sycl/source/detail/device_impl.cpp
++++ b/sycl/source/detail/device_impl.cpp
+@@ -366,6 +366,8 @@ bool device_impl::has(aspect Aspect) const {
+     return get_info<info::device::ext_oneapi_srgb>();
+   case aspect::ext_oneapi_native_assert:
+     return isAssertFailSupported();
++  case aspect::ext_samsung_pim:
++    return has_extension("samsung_pim");
+ 
+   default:
+     throw runtime_error("This device aspect has not been implemented yet.",
+diff --git a/sycl/source/detail/queue_impl.hpp b/sycl/source/detail/queue_impl.hpp
+index 0c05db22d126..52e2c09c27dc 100644
+--- a/sycl/source/detail/queue_impl.hpp
++++ b/sycl/source/detail/queue_impl.hpp
+@@ -15,6 +15,7 @@
+ #include <CL/sycl/event.hpp>
+ #include <CL/sycl/exception.hpp>
+ #include <CL/sycl/exception_list.hpp>
++#include <CL/sycl/feature_test.hpp>
+ #include <CL/sycl/handler.hpp>
+ #include <CL/sycl/properties/context_properties.hpp>
+ #include <CL/sycl/properties/queue_properties.hpp>
+@@ -29,6 +30,9 @@
+ #include <detail/plugin.hpp>
+ #include <detail/scheduler/scheduler.hpp>
+ #include <detail/thread_pool.hpp>
++#if SYCL_EXT_SAMSUNG_PIM
++#include <sycl/ext/samsung/pim/pim_handler.hpp>
++#endif // SYCL_EXT_SAMSUNG_PIM
+ 
+ #include <utility>
+ 
+@@ -251,6 +255,54 @@ public:
+     return submit_impl(CGF, Self, Self, nullptr, Loc, PostProcess);
+   }
+ 
++#if SYCL_EXT_SAMSUNG_PIM
++  /// Submits a PIM command-group function object to the queue, in order to be
++  /// scheduled for execution on the device.
++  ///
++  /// \param CGF is a function object containing a command group accepting a
++  /// pim_handler as argument.
++  /// \param Self is a shared_ptr to this queue
++  /// \param Loc is the code location of the submit call (default argument)
++  /// \param PostProcess is currently unused for PIM command-groups
++  /// \return a SYCL event object for the submitted command group.
++  event submit(const std::function<void(ext::samsung::pim_handler &)> &CGF,
++               const std::shared_ptr<queue_impl> &Self,
++               const detail::code_location &Loc,
++               const SubmitPostProcessF *PostProcess = nullptr) {
++    return submit_impl(CGF, Self, Self, nullptr, Loc, PostProcess);
++  }
++
++  /// Submits a PIM command-group function object to the queue, in order to be
++  /// scheduled for execution on the device.
++  ///
++  /// On a kernel error, this command group function object is then scheduled
++  /// for execution on a secondary queue.
++  ///
++  /// \param CGF is a function object containing a command group accepting a
++  /// pim_handler as argument.
++  /// \param Self is a shared_ptr to this queue
++  /// \param Loc is the code location of the submit call (default argument)
++  /// \param PostProcess is currently unused for PIM command-groups
++  /// \return a SYCL event object for the submitted command group.
++  event submit(const std::function<void(ext::samsung::pim_handler &)> &CGF,
++               const std::shared_ptr<queue_impl> &Self,
++               const std::shared_ptr<queue_impl> &SecondQueue,
++               const detail::code_location &Loc,
++               const SubmitPostProcessF *PostProcess = nullptr) {
++    try {
++      return submit_impl(CGF, Self, Self, SecondQueue, Loc, PostProcess);
++    } catch (...) {
++      {
++        std::lock_guard<std::mutex> Lock(MMutex);
++        MExceptions.PushBack(std::current_exception());
++      }
++      return SecondQueue->submit_impl(CGF, SecondQueue, Self, SecondQueue, Loc,
++                                      PostProcess);
++    }
++  }
++
++#endif // SYCL_EXT_SAMSUNG_PIM
++
+   /// Performs a blocking wait for the completion of all enqueued tasks in the
+   /// queue.
+   ///
+@@ -522,6 +574,37 @@ private:
+     return Event;
+   }
+ 
++#if SYCL_EXT_SAMSUNG_PIM
++  event submit_impl(const std::function<void(ext::samsung::pim_handler &)> &CGF,
++                    const std::shared_ptr<queue_impl> &Self,
++                    const std::shared_ptr<queue_impl> &PrimaryQueue,
++                    const std::shared_ptr<queue_impl> &SecondaryQueue,
++                    const detail::code_location &Loc,
++                    const SubmitPostProcessF *PostProcess) {
++    ext::samsung::pim_handler Handler{Self};
++    Handler.saveCodeLoc(Loc);
++    CGF(Handler);
++
++    if (!this->get_device().has(aspect::ext_samsung_pim)) {
++      throw sycl::exception(
++          sycl::make_error_code(sycl::errc::feature_not_supported),
++          "ext::samsung::pim_handler only supported on queues backed by device "
++          "with aspect::ext:samsung_pim");
++    }
++
++    // At the time of writing, the post-processing seems to be used for kernels
++    // that use asserts. This does not apply to PIM operations.
++    assert(PostProcess == nullptr &&
++           "PIM handler does not support post-processing.");
++
++    event Event;
++    finalizeHandler(Handler, CG::CGTYPE::PIMOp, Event);
++
++    addEvent(Event);
++    return Event;
++  }
++#endif // SYCL_EXT_SAMSUNG_PIM
++
+   // When instrumentation is enabled emits trace event for wait begin and
+   // returns the telemetry event generated for the wait
+   void *instrumentationProlog(const detail::code_location &CodeLoc,
+@@ -553,8 +636,8 @@ private:
+   std::vector<std::weak_ptr<event_impl>> MEventsWeak;
+ 
+   /// Events without data dependencies (such as USM) need an owner,
+-  /// additionally, USM operations are not added to the scheduler command graph,
+-  /// queue is the only owner on the runtime side.
++  /// additionally, USM operations are not added to the scheduler command
++  /// graph, queue is the only owner on the runtime side.
+   std::vector<event> MEventsShared;
+   exception_list MExceptions;
+   const async_handler MAsyncHandler;
+@@ -572,8 +655,8 @@ private:
+   // Buffer to store assert failure descriptor
+   buffer<AssertHappened, 1> MAssertHappenedBuffer;
+ 
+-  // This event is employed for enhanced dependency tracking with in-order queue
+-  // Access to the event should be guarded with MLastEventMtx
++  // This event is employed for enhanced dependency tracking with in-order
++  // queue Access to the event should be guarded with MLastEventMtx
+   event MLastEvent;
+   std::mutex MLastEventMtx;
+   // Used for in-order queues in pair with MLastEvent
+@@ -589,11 +672,11 @@ public:
+   const bool MIsProfilingEnabled;
+ 
+ private:
+-  // This flag says if we can discard events based on a queue "setup" which will
+-  // be common for all operations submitted to the queue. This is a must
+-  // condition for discarding, but even if it's true, in some cases, we won't be
+-  // able to discard events, because the final decision is made right before the
+-  // operation itself.
++  // This flag says if we can discard events based on a queue "setup" which
++  // will be common for all operations submitted to the queue. This is a must
++  // condition for discarding, but even if it's true, in some cases, we won't
++  // be able to discard events, because the final decision is made right
++  // before the operation itself.
+   const bool MHasDiscardEventsSupport;
+ };
+ 
+diff --git a/sycl/source/detail/scheduler/commands.cpp b/sycl/source/detail/scheduler/commands.cpp
+index 6138b21723a5..4a4846db4364 100644
+--- a/sycl/source/detail/scheduler/commands.cpp
++++ b/sycl/source/detail/scheduler/commands.cpp
+@@ -931,7 +931,6 @@ void AllocaCommand::printDot(std::ostream &Stream) const {
+   Stream << " Link : " << this->MLinkedAllocaCmd << "\\n";
+   Stream << "\"];" << std::endl;
+ 
+-
+   for (const auto &Dep : MDeps) {
+     if (Dep.MDepCommand == nullptr)
+       continue;
+@@ -1077,7 +1076,6 @@ cl_int ReleaseCommand::enqueueImp() {
+     // 3. Device alloca in the pair should be in active state in order to be
+     //    correctly released.
+ 
+-
+     // There is no actual memory allocation if a host alloca command is created
+     // being linked to a device allocation.
+     SkipRelease |= CurAllocaIsHost && !MAllocaCmd->MIsLeaderAlloca;
+@@ -2203,6 +2201,7 @@ cl_int ExecCGCommand::enqueueImp() {
+                         MCommandGroup->MRequirements.size() == 0)
+                            ? nullptr
+                            : &MEvent->getHandleRef();
++  // TODO(Lukas, SP-17): Handle CGTYPE::PIM.
+   switch (MCommandGroup->getType()) {
+ 
+   case CG::CGTYPE::UpdateHost: {
+diff --git a/sycl/source/handler.cpp b/sycl/source/handler.cpp
+index aa349c90a6f3..65c041c355c4 100644
+--- a/sycl/source/handler.cpp
++++ b/sycl/source/handler.cpp
+@@ -381,6 +381,10 @@ event handler::finalize() {
+         std::move(MAccStorage), std::move(MSharedPtrStorage),
+         std::move(MRequirements), std::move(MEvents), MCGType, MCodeLoc));
+     break;
++  case detail::CG::PIMOp:
++    // The regular sycl::handler does not support any PIM operations.
++    throw sycl::exception(sycl::errc::invalid,
++                          "PIM operations only supported on PIM handler.");
+   case detail::CG::None:
+     if (detail::pi::trace(detail::pi::TraceLevel::PI_TRACE_ALL)) {
+       std::cout << "WARNING: An empty command group is submitted." << std::endl;
+diff --git a/sycl/source/pim_handler.cpp b/sycl/source/pim_handler.cpp
+new file mode 100644
+index 000000000000..4670ea07a6f0
+--- /dev/null
++++ b/sycl/source/pim_handler.cpp
+@@ -0,0 +1,60 @@
++//==--- pim_handler.cpp --- SYCL command group handler for PIM operations --==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include <detail/event_impl.hpp>
++#include <sycl/ext/samsung/pim/pim_handler.hpp>
++
++__SYCL_INLINE_NAMESPACE(cl) {
++namespace sycl {
++namespace ext {
++namespace samsung {
++
++pim_handler::pim_handler(std::shared_ptr<sycl::detail::queue_impl> Queue)
++    : MQueue{std::move(Queue)} {}
++
++void pim_handler::depends_on(event Event) {
++  auto EventImpl = detail::getSyclObjImpl(Event);
++  if (EventImpl->isDiscarded()) {
++    throw sycl::exception(make_error_code(errc::invalid),
++                          "Queue operation cannot depend on discarded event.");
++  }
++  MEvents.push_back(EventImpl);
++}
++
++void pim_handler::depends_on(const std::vector<event> &Events) {
++  for (const event &Event : Events) {
++    auto EventImpl = detail::getSyclObjImpl(Event);
++    if (EventImpl->isDiscarded()) {
++      throw sycl::exception(
++          make_error_code(errc::invalid),
++          "Queue operation cannot depend on discarded event.");
++    }
++    MEvents.push_back(EventImpl);
++  }
++}
++
++event pim_handler::finalize() {
++  // TODO(Lukas, SP-17) The regular handler defines a short-cut for cases where
++  // no dependencies are added to the graph (MRequirements.size() +
++  // MEvents.size() + MStreamStorage.size() == 0). In those cases, the kernel is
++  // launched immediately. We could potentially do something similar here.
++
++  // TODO(Lukas, SP-17): Construct an actual command to be executed by the
++  // scheduler.
++
++  if (detail::pi::trace(detail::pi::TraceLevel::PI_TRACE_ALL)) {
++    std::cout << "WARNING: PIM operations not yet implemented." << std::endl;
++  }
++  detail::EventImplPtr Event = std::make_shared<cl::sycl::detail::event_impl>();
++  return detail::createSyclObjFromImpl<event>(Event);
++}
++
++} // namespace samsung
++} // namespace ext
++} // namespace sycl
++} // __SYCL_INLINE_NAMESPACE(cl)
+diff --git a/sycl/source/queue.cpp b/sycl/source/queue.cpp
+index b660c6f07f26..a35147390395 100644
+--- a/sycl/source/queue.cpp
++++ b/sycl/source/queue.cpp
+@@ -76,7 +76,6 @@ device queue::get_device() const { return impl->get_device(); }
+ 
+ bool queue::is_host() const { return impl->is_host(); }
+ 
+-
+ void queue::throw_asynchronous() { impl->throw_asynchronous(); }
+ 
+ event queue::memset(void *Ptr, int Value, size_t Count) {
+@@ -142,6 +141,19 @@ event queue::submit_impl(std::function<void(handler &)> CGH, queue SecondQueue,
+   return impl->submit(CGH, impl, SecondQueue.impl, CodeLoc);
+ }
+ 
++#if SYCL_EXT_SAMSUNG_PIM
++event queue::submit_impl(std::function<void(ext::samsung::pim_handler &)> CGH,
++                         const detail::code_location &CodeLoc) {
++  return impl->submit(CGH, impl, CodeLoc);
++}
++
++event queue::submit_impl(std::function<void(ext::samsung::pim_handler &)> CGH,
++                         queue SecondQueue,
++                         const detail::code_location &CodeLoc) {
++  return impl->submit(CGH, impl, SecondQueue.impl, CodeLoc);
++}
++#endif // SYCL_EXT_SAMSUNG_PIM
++
+ event queue::submit_impl_and_postprocess(
+     std::function<void(handler &)> CGH, const detail::code_location &CodeLoc,
+     const SubmitPostProcessF &PostProcess) {
+diff --git a/sycl/test/basic_tests/stream/byte.cpp b/sycl/test/basic_tests/stream/byte.cpp
+index 33d89e165af9..b87ce0b46000 100644
+--- a/sycl/test/basic_tests/stream/byte.cpp
++++ b/sycl/test/basic_tests/stream/byte.cpp
+@@ -5,7 +5,10 @@
+ 
+ int main() {
+   sycl::queue q;
+-  q.submit([](auto &h) {
++  // TODO(Lukas, SP-20): Had to replace the 'auto' parameter of this lambda,
++  // because the dispatch to the correct handler type in the queue doesn't work
++  // for this case.
++  q.submit([](sycl::handler &h) {
+     sycl::stream os(1024, 256, h);
+     h.single_task([=] { os << std::byte(2) << "\n"; });
+   });
+-- 
+2.17.1
+

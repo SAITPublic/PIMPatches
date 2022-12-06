@@ -1,0 +1,1766 @@
+From d6e52effa0626f972bb5c24b3d888fbc970ae9dd Mon Sep 17 00:00:00 2001
+From: Lukas Sommer <lukas.sommer@codeplay.com>
+Date: Tue, 5 Jul 2022 07:29:55 +0000
+Subject: [PATCH 08/17] [SYCL][PIM] Pass additional layout information to PIM
+ memory
+
+Removes unnecessary constructor parameters from pim_accessor.
+
+Pass additional layout information about buffers and accessors
+to HIP PI, for correct functionality of PIM GEMV operation and
+PIM operations on ranged pim_accessors.
+---
+ sycl/include/CL/sycl/accessor.hpp             |  45 +-
+ sycl/include/CL/sycl/detail/buffer_impl.hpp   |   3 +-
+ sycl/include/CL/sycl/detail/image_impl.hpp    |   3 +-
+ .../include/CL/sycl/detail/memory_manager.hpp |   8 +-
+ sycl/include/CL/sycl/detail/pi.h              |   2 -
+ .../include/CL/sycl/detail/sycl_mem_obj_i.hpp |   4 +-
+ .../include/CL/sycl/detail/sycl_mem_obj_t.hpp |  11 +-
+ .../sycl/ext/samsung/pim/pim_accessor.hpp     |  98 +---
+ .../sycl/ext/samsung/pim/pim_handler.hpp      |  37 +-
+ sycl/plugins/hip/pi_hip.cpp                   | 217 ++++-----
+ sycl/plugins/hip/pi_hip.hpp                   |  25 +-
+ sycl/source/detail/buffer_impl.cpp            |   5 +-
+ sycl/source/detail/image_impl.cpp             |   4 +-
+ sycl/source/detail/memory_manager.cpp         |  41 +-
+ sycl/source/detail/scheduler/commands.cpp     |  63 ++-
+ sycl/test/abi/vtable.cpp                      |   2 +-
+ sycl/unittests/pi/pim/pim_test_utils.hpp      |   6 +-
+ sycl/unittests/pi/pim/test_pim_mem_obj.cpp    |   6 +-
+ sycl/unittests/pi/pim/test_pim_operations.cpp | 438 ++++++++++++++++--
+ .../scheduler/LinkedAllocaDependencies.cpp    |   2 +-
+ 20 files changed, 692 insertions(+), 328 deletions(-)
+
+diff --git a/sycl/include/CL/sycl/accessor.hpp b/sycl/include/CL/sycl/accessor.hpp
+index 2de078a38714..7a0d2af2960f 100644
+--- a/sycl/include/CL/sycl/accessor.hpp
++++ b/sycl/include/CL/sycl/accessor.hpp
+@@ -261,6 +261,25 @@ static T<NewDim> convertToArrayOfN(T<OldDim> OldObj) {
+   return NewObj;
+ }
+ 
++/// The organization of accessor ids and ranges depends on the number of
++/// dimensions. This function allows to convert a range/id for an accessor with
++/// the given number of dimensions into a range/id{width, height, depth}.
++template <template <int> class T>
++static T<3> convertRangeToXYZ(T<3> OldRange, size_t Dims) {
++  // For buffers, the offsets/ranges coming from accessor are always
++  // id<3>/range<3> But their organization varies by dimension:
++  //  1 ==>  {width, 1, 1}
++  //  2 ==>  {height, width, 1}
++  //  3 ==>  {depth, height, width}
++  if (Dims == 3) {
++    return T<3>{OldRange[2], OldRange[1], OldRange[0]};
++  } else if (Dims == 2) {
++    return T<3>{OldRange[1], OldRange[0], OldRange[2]};
++  } else { // Dimension is 1 or 0
++    return T<3>{OldRange[0], OldRange[1], OldRange[2]};
++  }
++}
++
+ __SYCL_EXPORT device getDeviceFromHandler(handler &CommandGroupHandlerRef);
+ 
+ template <typename DataT, int Dimensions, access::mode AccessMode,
+@@ -2078,7 +2097,8 @@ public:
+   accessor(handler &, const detail::code_location CodeLoc =
+                           detail::code_location::current())
+ #ifdef __SYCL_DEVICE_ONLY__
+-      : impl(range<AdjustedDim>{1}){}
++      : impl(range<AdjustedDim>{1}) {
++  }
+ #else
+       : LocalAccessorBaseHost(range<3>{1, 1, 1}, AdjustedDim, sizeof(DataT)) {
+     detail::constructorNotification(nullptr, LocalAccessorBaseHost::impl.get(),
+@@ -2086,11 +2106,10 @@ public:
+   }
+ #endif
+ 
+-        template <int Dims = Dimensions,
+-                  typename = detail::enable_if_t<Dims == 0>>
+-        accessor(handler &, const property_list &propList,
+-                 const detail::code_location CodeLoc =
+-                     detail::code_location::current())
++  template <int Dims = Dimensions, typename = detail::enable_if_t<Dims == 0>>
++  accessor(
++      handler &, const property_list &propList,
++      const detail::code_location CodeLoc = detail::code_location::current())
+ #ifdef __SYCL_DEVICE_ONLY__
+       : impl(range<AdjustedDim>{1}) {
+     (void)propList;
+@@ -2108,7 +2127,8 @@ public:
+       range<Dimensions> AllocationSize, handler &,
+       const detail::code_location CodeLoc = detail::code_location::current())
+ #ifdef __SYCL_DEVICE_ONLY__
+-      : impl(AllocationSize){}
++      : impl(AllocationSize) {
++  }
+ #else
+       : LocalAccessorBaseHost(detail::convertToArrayOfN<3, 1>(AllocationSize),
+                               AdjustedDim, sizeof(DataT)) {
+@@ -2117,12 +2137,11 @@ public:
+   }
+ #endif
+ 
+-        template <int Dims = Dimensions,
+-                  typename = detail::enable_if_t<(Dims > 0)>>
+-        accessor(range<Dimensions> AllocationSize, handler &,
+-                 const property_list &propList,
+-                 const detail::code_location CodeLoc =
+-                     detail::code_location::current())
++  template <int Dims = Dimensions, typename = detail::enable_if_t<(Dims > 0)>>
++  accessor(
++      range<Dimensions> AllocationSize, handler &,
++      const property_list &propList,
++      const detail::code_location CodeLoc = detail::code_location::current())
+ #ifdef __SYCL_DEVICE_ONLY__
+       : impl(AllocationSize) {
+     (void)propList;
+diff --git a/sycl/include/CL/sycl/detail/buffer_impl.hpp b/sycl/include/CL/sycl/detail/buffer_impl.hpp
+index 1c6f0e31c667..f68aa53b30de 100644
+--- a/sycl/include/CL/sycl/detail/buffer_impl.hpp
++++ b/sycl/include/CL/sycl/detail/buffer_impl.hpp
+@@ -168,7 +168,8 @@ public:
+               std::move(Allocator)) {}
+ 
+   void *allocateMem(ContextImplPtr Context, bool InitFromUserData,
+-                    void *HostPtr, RT::PiEvent &OutEventToWait) override;
++                    void *HostPtr, RT::PiEvent &OutEventToWait,
++                    sycl::range<3> BufferSize) override;
+   void constructorNotification(const detail::code_location &CodeLoc,
+                                void *UserObj, const void *HostObj,
+                                const void *Type, uint32_t Dim,
+diff --git a/sycl/include/CL/sycl/detail/image_impl.hpp b/sycl/include/CL/sycl/detail/image_impl.hpp
+index b708e29e9f67..87f20c3ef693 100644
+--- a/sycl/include/CL/sycl/detail/image_impl.hpp
++++ b/sycl/include/CL/sycl/detail/image_impl.hpp
+@@ -209,7 +209,8 @@ public:
+   size_t size() const noexcept { return MRange.size(); }
+ 
+   void *allocateMem(ContextImplPtr Context, bool InitFromUserData,
+-                    void *HostPtr, RT::PiEvent &OutEventToWait) override;
++                    void *HostPtr, RT::PiEvent &OutEventToWait,
++                    sycl::range<3> ImageSize) override;
+ 
+   MemObjType getType() const override { return MemObjType::Image; }
+ 
+diff --git a/sycl/include/CL/sycl/detail/memory_manager.hpp b/sycl/include/CL/sycl/detail/memory_manager.hpp
+index dfeb1b1365f6..b9db28b2a7e4 100644
+--- a/sycl/include/CL/sycl/detail/memory_manager.hpp
++++ b/sycl/include/CL/sycl/detail/memory_manager.hpp
+@@ -47,7 +47,7 @@ public:
+   static void *allocate(ContextImplPtr TargetContext, SYCLMemObjI *MemObj,
+                         bool InitFromUserData, void *HostPtr,
+                         std::vector<EventImplPtr> DepEvents,
+-                        RT::PiEvent &OutEvent);
++                        RT::PiEvent &OutEvent, sycl::range<3> MemSize);
+ 
+   // Allocates memory buffer wrapped into an image. MemObj must be a buffer,
+   // not an image.
+@@ -76,7 +76,8 @@ public:
+                                  const EventImplPtr &InteropEvent,
+                                  const ContextImplPtr &InteropContext,
+                                  const sycl::property_list &PropsList,
+-                                 RT::PiEvent &OutEventToWait);
++                                 RT::PiEvent &OutEventToWait,
++                                 sycl::range<3> BufferSize);
+ 
+   // Allocates images in specified context taking into account situations such
+   // as host ptr or cl_mem provided by user. TargetContext should be device
+@@ -112,7 +113,8 @@ public:
+ 
+   static void *allocateBufferObject(ContextImplPtr TargetContext, void *UserPtr,
+                                     bool HostPtrReadOnly, const size_t Size,
+-                                    const sycl::property_list &PropsList);
++                                    const sycl::property_list &PropsList,
++                                    sycl::range<3> BufferSize);
+ 
+   // Copies memory between: host and device, host and host,
+   // device and device if memory objects bound to the one context.
+diff --git a/sycl/include/CL/sycl/detail/pi.h b/sycl/include/CL/sycl/detail/pi.h
+index 1aee02c1dcf7..586466d8b966 100644
+--- a/sycl/include/CL/sycl/detail/pi.h
++++ b/sycl/include/CL/sycl/detail/pi.h
+@@ -630,8 +630,6 @@ constexpr pi_mem_properties PI_MEM_PROPERTIES_CHANNEL = CL_MEM_CHANNEL_INTEL;
+ constexpr pi_mem_properties PI_MEM_PROPERTIES_ALLOC_BUFFER_LOCATION =
+     CL_MEM_ALLOC_BUFFER_LOCATION_INTEL;
+ constexpr pi_mem_properties PI_MEM_PROPERTIES_PIM_DIMENSIONS = 0x9901;
+-constexpr pi_mem_properties PI_MEM_PROPERTIES_PIM_OP_TYPE = 0x9902;
+-constexpr pi_mem_properties PI_MEM_PROPERTIES_PIM_MEM_FLAG = 0x9903;
+ 
+ // NOTE: this is made 64-bit to match the size of cl_mem_properties_intel to
+ // make the translation to OpenCL transparent.
+diff --git a/sycl/include/CL/sycl/detail/sycl_mem_obj_i.hpp b/sycl/include/CL/sycl/detail/sycl_mem_obj_i.hpp
+index c37d4945f1e9..03ec07fd409e 100644
+--- a/sycl/include/CL/sycl/detail/sycl_mem_obj_i.hpp
++++ b/sycl/include/CL/sycl/detail/sycl_mem_obj_i.hpp
+@@ -10,6 +10,7 @@
+ 
+ #include <CL/sycl/detail/pi.hpp>
+ #include <CL/sycl/stl.hpp>
++#include <CL/sycl/range.hpp>
+ 
+ __SYCL_INLINE_NAMESPACE(cl) {
+ namespace sycl {
+@@ -44,7 +45,8 @@ public:
+   // Method returns a pointer to host allocation if Context is host one and
+   // cl_mem obect if not.
+   virtual void *allocateMem(ContextImplPtr Context, bool InitFromUserData,
+-                            void *HostPtr, RT::PiEvent &InteropEvent) = 0;
++                            void *HostPtr, RT::PiEvent &InteropEvent,
++                            sycl::range<3> MemSize) = 0;
+ 
+   // Should be used for memory object created without use_host_ptr property.
+   virtual void *allocateHostMem() = 0;
+diff --git a/sycl/include/CL/sycl/detail/sycl_mem_obj_t.hpp b/sycl/include/CL/sycl/detail/sycl_mem_obj_t.hpp
+index 1888c1ef1108..db4aeb61fda9 100644
+--- a/sycl/include/CL/sycl/detail/sycl_mem_obj_t.hpp
++++ b/sycl/include/CL/sycl/detail/sycl_mem_obj_t.hpp
+@@ -35,8 +35,7 @@ class plugin;
+ using ContextImplPtr = std::shared_ptr<context_impl>;
+ using EventImplPtr = std::shared_ptr<event_impl>;
+ 
+-template <typename T>
+-class aligned_allocator;
++template <typename T> class aligned_allocator;
+ using sycl_memory_object_allocator = aligned_allocator<char>;
+ 
+ // The class serves as a base for all SYCL memory objects.
+@@ -184,9 +183,7 @@ public:
+     if (!FinalData)
+       MUploadDataFunctor = nullptr;
+     else
+-      MUploadDataFunctor = [this, FinalData]() {
+-        updateHostMemory(FinalData);
+-      };
++      MUploadDataFunctor = [this, FinalData]() { updateHostMemory(FinalData); };
+   }
+ 
+   template <typename Destination>
+@@ -308,11 +305,13 @@ public:
+ 
+   __SYCL_DLL_LOCAL void *allocateMem(ContextImplPtr Context,
+                                      bool InitFromUserData, void *HostPtr,
+-                                     RT::PiEvent &InteropEvent) override {
++                                     RT::PiEvent &InteropEvent,
++                                     sycl::range<3> MemSize) override {
+     (void)Context;
+     (void)InitFromUserData;
+     (void)HostPtr;
+     (void)InteropEvent;
++    (void)MemSize;
+     throw runtime_error("Not implemented", PI_INVALID_OPERATION);
+   }
+ 
+diff --git a/sycl/include/sycl/ext/samsung/pim/pim_accessor.hpp b/sycl/include/sycl/ext/samsung/pim/pim_accessor.hpp
+index 64ebf5e36e51..da95611282c7 100644
+--- a/sycl/include/sycl/ext/samsung/pim/pim_accessor.hpp
++++ b/sycl/include/sycl/ext/samsung/pim/pim_accessor.hpp
+@@ -17,24 +17,6 @@ __SYCL_INLINE_NAMESPACE(cl) {
+ namespace sycl {
+ namespace ext {
+ namespace samsung {
+-enum class pim_mem_flag {
+-  unspecified,
+-  elementwise_op,
+-  gemv_input,
+-  gemv_weight,
+-  gemv_output,
+-  gemv_weight_t
+-};
+-
+-enum class pim_op_type {
+-  unspecified,
+-  gemv,
+-  elt_add,
+-  elt_mul,
+-  relu,
+-  batch_norm,
+-  copy
+-};
+ 
+ template <typename DataT, int Dimensions = 1,
+           access_mode AccessMode =
+@@ -79,10 +61,7 @@ public:
+   template <typename AllocatorT>
+   pim_accessor(
+       buffer<DataT, Dimensions, AllocatorT> &BufferRef,
+-      pim_handler &PimHandlerRef,
+-      pim_mem_flag MemFlag = pim_mem_flag::unspecified,
+-      pim_op_type OpType = pim_op_type::unspecified,
+-      const property_list &PropList = {},
++      pim_handler &PimHandlerRef, const property_list &PropList = {},
+       const detail::code_location CodeLoc = detail::code_location::current())
+       : AccessorBaseHost(
+             /*Offset=*/{0, 0, 0},
+@@ -94,9 +73,6 @@ public:
+     preScreenAccessor(BufferRef.size(), PropList);
+     detail::associateWithPIMHandler(PimHandlerRef, this,
+                                     access::target::device);
+-    // TODO(Lukas, SP-21): Handle MemFlag and OpType
+-    (void)MemFlag;
+-    (void)OpType;
+     detail::constructorNotification(detail::getSyclObjImpl(BufferRef).get(),
+                                     detail::AccessorBaseHost::impl.get(),
+                                     access::target::device, AccessMode,
+@@ -107,24 +83,18 @@ public:
+   pim_accessor(
+       buffer<DataT, Dimensions, AllocatorT> &BufferRef,
+       pim_handler &PimHandlerRef, range<Dimensions> AccessRange,
+-      pim_mem_flag MemFlag = pim_mem_flag::unspecified,
+-      pim_op_type OpType = pim_op_type::unspecified,
+       const property_list &PropList = {},
+       const detail::code_location CodeLoc = detail::code_location::current())
+-      : pim_accessor(BufferRef, PimHandlerRef, AccessRange, {}, MemFlag, OpType,
+-                     PropList) {}
++      : pim_accessor(BufferRef, PimHandlerRef, AccessRange, {}, PropList) {}
+ 
+   template <typename AllocatorT>
+   pim_accessor(
+       buffer<DataT, Dimensions, AllocatorT> &BufferRef,
+       pim_handler &PimHandlerRef, range<Dimensions> AccessRange,
+-      id<Dimensions> AccessOffset,
+-      pim_mem_flag MemFlag = pim_mem_flag::unspecified,
+-      pim_op_type OpType = pim_op_type::unspecified,
+-      const property_list &PropList = {},
++      id<Dimensions> AccessOffset, const property_list &PropList = {},
+       const detail::code_location CodeLoc = detail::code_location::current())
+       : AccessorBaseHost(
+-            ::sycl::detail::convertToArrayOfN<3, 1>(AccessOffset),
++            ::sycl::detail::convertToArrayOfN<3, 0>(AccessOffset),
+             ::sycl::detail::convertToArrayOfN<3, 1>(AccessRange),
+             ::sycl::detail::convertToArrayOfN<3, 1>(BufferRef.get_range()),
+             getAdjustedMode<AccessMode>(PropList),
+@@ -139,9 +109,6 @@ public:
+     }
+     detail::associateWithPIMHandler(PimHandlerRef, this,
+                                     access::target::device);
+-    // TODO(Lukas, SP-21): Handle MemFlag and OpType
+-    (void)MemFlag;
+-    (void)OpType;
+     detail::constructorNotification(detail::getSyclObjImpl(BufferRef).get(),
+                                     detail::AccessorBaseHost::impl.get(),
+                                     access::target::device, AccessMode,
+@@ -153,38 +120,29 @@ public:
+             std::enable_if_t<IsValidTag<TagT>(), bool> = true>
+   pim_accessor(
+       buffer<DataT, Dimensions, AllocatorT> &BufferRef,
+-      pim_handler &PimHandlerRef, TagT,
+-      pim_mem_flag MemFlag = pim_mem_flag::unspecified,
+-      pim_op_type OpType = pim_op_type::unspecified,
+-      const property_list &PropList = {},
++      pim_handler &PimHandlerRef, TagT, const property_list &PropList = {},
+       const detail::code_location CodeLoc = detail::code_location::current())
+-      : pim_accessor(BufferRef, PimHandlerRef, MemFlag, OpType, PropList,
+-                     CodeLoc) {}
++      : pim_accessor(BufferRef, PimHandlerRef, PropList, CodeLoc) {}
+ 
+   template <typename AllocatorT, typename TagT,
+             std::enable_if_t<IsValidTag<TagT>(), bool> = true>
+   pim_accessor(
+       buffer<DataT, Dimensions, AllocatorT> &BufferRef,
+       pim_handler &PimHandlerRef, range<Dimensions> AccessRange, TagT,
+-      pim_mem_flag MemFlag = pim_mem_flag::unspecified,
+-      pim_op_type OpType = pim_op_type::unspecified,
+       const property_list &PropList = {},
+       const detail::code_location CodeLoc = detail::code_location::current())
+-      : pim_accessor(BufferRef, PimHandlerRef, AccessRange, MemFlag, OpType,
+-                     PropList, CodeLoc) {}
++      : pim_accessor(BufferRef, PimHandlerRef, AccessRange, PropList, CodeLoc) {
++  }
+ 
+   template <typename AllocatorT, typename TagT,
+             std::enable_if_t<IsValidTag<TagT>(), bool> = true>
+   pim_accessor(
+       buffer<DataT, Dimensions, AllocatorT> &BufferRef,
+       pim_handler &PimHandlerRef, range<Dimensions> AccessRange,
+-      id<Dimensions> AccessOffset, TagT,
+-      pim_mem_flag MemFlag = pim_mem_flag::unspecified,
+-      pim_op_type OpType = pim_op_type::unspecified,
+-      const property_list &PropList = {},
++      id<Dimensions> AccessOffset, TagT, const property_list &PropList = {},
+       const detail::code_location CodeLoc = detail::code_location::current())
+       : pim_accessor(BufferRef, PimHandlerRef, AccessRange, AccessOffset,
+-                     MemFlag, OpType, PropList, CodeLoc) {}
++                     PropList, CodeLoc) {}
+ #endif
+ 
+   size_type byte_size() const noexcept { return size() * getElemSize(); }
+@@ -213,17 +171,7 @@ public:
+ // Deduction guides for the constructors taking a tag to specify an access mode.
+ template <typename DataT, int Dim, typename AllocatorT, typename Type1>
+ pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, Type1,
+-             pim_mem_flag, pim_op_type, const property_list &)
+-    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
+-
+-template <typename DataT, int Dim, typename AllocatorT, typename Type1>
+-pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, Type1,
+-             pim_mem_flag, pim_op_type)
+-    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
+-
+-template <typename DataT, int Dim, typename AllocatorT, typename Type1>
+-pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, Type1,
+-             pim_mem_flag)
++             const property_list &)
+     -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
+ 
+ template <typename DataT, int Dim, typename AllocatorT, typename Type1>
+@@ -232,17 +180,7 @@ pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, Type1)
+ 
+ template <typename DataT, int Dim, typename AllocatorT, typename Type1>
+ pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>, Type1,
+-             pim_mem_flag, pim_op_type, const property_list &)
+-    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
+-
+-template <typename DataT, int Dim, typename AllocatorT, typename Type1>
+-pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>, Type1,
+-             pim_mem_flag, pim_op_type)
+-    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
+-
+-template <typename DataT, int Dim, typename AllocatorT, typename Type1>
+-pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>, Type1,
+-             pim_mem_flag)
++             const property_list &)
+     -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
+ 
+ template <typename DataT, int Dim, typename AllocatorT, typename Type1>
+@@ -251,17 +189,7 @@ pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>, Type1)
+ 
+ template <typename DataT, int Dim, typename AllocatorT, typename Type1>
+ pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>,
+-             id<Dim>, Type1, pim_mem_flag, pim_op_type, const property_list &)
+-    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
+-
+-template <typename DataT, int Dim, typename AllocatorT, typename Type1>
+-pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>,
+-             id<Dim>, Type1, pim_mem_flag, pim_op_type)
+-    -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
+-
+-template <typename DataT, int Dim, typename AllocatorT, typename Type1>
+-pim_accessor(buffer<DataT, Dim, AllocatorT> &, pim_handler &, range<Dim>,
+-             id<Dim>, Type1, pim_mem_flag)
++             id<Dim>, Type1, const property_list &)
+     -> pim_accessor<DataT, Dim, detail::deduceAccessMode<Type1, Type1>()>;
+ 
+ template <typename DataT, int Dim, typename AllocatorT, typename Type1>
+diff --git a/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp b/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
+index 502d8f58be8d..c74e270084c9 100644
+--- a/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
++++ b/sycl/include/sycl/ext/samsung/pim/pim_handler.hpp
+@@ -204,11 +204,11 @@ private:
+   void associateWithHandler(detail::AccessorBaseHost *AccBase,
+                             access::target AccTarget);
+ 
+-  template <typename DataT, int Dimensions, access_mode OutMode,
+-            access_mode Op0Mode, access_mode Op1Mode>
+-  void vectorOperation(pim_accessor<DataT, Dimensions, OutMode> output,
+-                       pim_accessor<DataT, Dimensions, Op0Mode> operand0,
+-                       pim_accessor<DataT, Dimensions, Op1Mode> operand1,
++  template <typename DataT, int OutDim, access_mode OutMode, int Op0Dim,
++            access_mode Op0Mode, int Op1Dim, access_mode Op1Mode>
++  void vectorOperation(pim_accessor<DataT, OutDim, OutMode> output,
++                       pim_accessor<DataT, Op0Dim, Op0Mode> operand0,
++                       pim_accessor<DataT, Op1Dim, Op1Mode> operand1,
+                        detail::CGPim::PIM_OPERATION opCode) {
+     static_assert(std::is_same<DataT, sycl::half>::value,
+                   "PIM currently only supports FP16");
+@@ -221,8 +221,8 @@ private:
+     throwIfNonEmpty();
+     MOp = opCode;
+     setAccessorArgHelper(0, std::move(output));
+-    setAccessorArgHelper(1, std::move(operand0));
+-    setAccessorArgHelper(2, std::move(operand1));
++    setAccessorArgHelper(7, std::move(operand0));
++    setAccessorArgHelper(14, std::move(operand1));
+   }
+ 
+   template <typename DataT, int Dimensions, access_mode OutMode,
+@@ -240,8 +240,8 @@ private:
+     throwIfNonEmpty();
+     MOp = opCode;
+     setAccessorArgHelper(0, std::move(output));
+-    setScalarArgHelper(1, scalar);
+-    setAccessorArgHelper(2, std::move(vec));
++    setScalarArgHelper(7, scalar);
++    setAccessorArgHelper(8, std::move(vec));
+   }
+ 
+   void throwIfNonEmpty() {
+@@ -267,6 +267,25 @@ private:
+     // Add accessor to the list of arguments.
+     MArgs.emplace_back(detail::kernel_param_kind_t::kind_accessor, Req,
+                        static_cast<int>(access::target::device), ArgIndex);
++    // If the accessor is ranged and has an offset, the device buffer created by
++    // the SYCL RT might still have the full size of the underlying buffer. In
++    // that case, the size of the PimBo created for the device buffer won't
++    // match the range on which the operation should actually be executed. To
++    // avoid this, we additionally pass the range and offset information of the
++    // accessor to PI, so the operation can be limited to the actual range of
++    // the accessor.
++    // Make sure that the range/offset information is in the organized as
++    // {width, height, depth}.
++    auto AccRange = ::sycl::detail::convertRangeToXYZ(
++        ::sycl::detail::convertToArrayOfN<3, 1>(Arg.get_range()), DataDim);
++    auto AccOffset = ::sycl::detail::convertRangeToXYZ(
++        ::sycl::detail::convertToArrayOfN<3, 0>(Arg.get_offset()), DataDim);
++    setScalarArgHelper(ArgIndex + 1, AccRange[0]);
++    setScalarArgHelper(ArgIndex + 2, AccRange[1]);
++    setScalarArgHelper(ArgIndex + 3, AccRange[2]);
++    setScalarArgHelper(ArgIndex + 4, AccOffset[0]);
++    setScalarArgHelper(ArgIndex + 5, AccOffset[1]);
++    setScalarArgHelper(ArgIndex + 6, AccOffset[2]);
+   }
+ 
+   /// Stores copy of Arg passed to the MArgsStorage.
+diff --git a/sycl/plugins/hip/pi_hip.cpp b/sycl/plugins/hip/pi_hip.cpp
+index 1f32430a3f2b..efd4612dfb94 100644
+--- a/sycl/plugins/hip/pi_hip.cpp
++++ b/sycl/plugins/hip/pi_hip.cpp
+@@ -234,72 +234,132 @@ pi_result executePIMOperation(pi_kernel kernel, pi_queue command_queue) {
+   sycl::detail::pi::die("PIM Operation not implemented.");
+ }
+ 
++bool getRangedBufferWithOffset(const std::vector<void *> &arguments,
++                               size_t index, PimBo **buffer) {
++  *buffer = *static_cast<PimBo **>(arguments[index]);
++  size_t rangeX = **static_cast<size_t **>(arguments[index + 1]);
++  size_t rangeY = **static_cast<size_t **>(arguments[index + 2]);
++  size_t rangeZ = **static_cast<size_t **>(arguments[index + 3]);
++  size_t offsetX = **static_cast<size_t **>(arguments[index + 4]);
++  size_t offsetY = **static_cast<size_t **>(arguments[index + 5]);
++  size_t offsetZ = **static_cast<size_t **>(arguments[index + 6]);
++  auto shape = (*buffer)->bshape;
++  if (offsetX || offsetY || offsetZ || shape.w != rangeX || shape.h != rangeY ||
++      shape.c != rangeZ) {
++    assert((offsetX + rangeX) <= shape.w && "PIM buffer access out-of-range");
++    assert((offsetY + rangeY) <= shape.h && "PIM buffer access out-of-range");
++    assert((offsetZ + rangeZ) <= shape.c && "PIM buffer access out-of-range");
++    // If a PIM operation is called with a ranged accessor, the device buffer
++    // (PimBo) that was created for this accessor might still have the full size
++    // of the original buffer. In that case, the bshape information of the PimBo
++    // won't match the intended operating range of the PIM operation on the
++    // ranged accessor. To limit the operation to the intended range, we create
++    // a new temporary PimBo with correct shape information. Because we pass the
++    // pointer to the existing device allocation, this temporary PimBo will not
++    // allocate any additional memory.
++    auto offset = (offsetZ * shape.h + offsetY) * shape.w + offsetX;
++    void *pointer = static_cast<void *>(static_cast<char *>((*buffer)->data) +
++                                        offset * /* sizeof(FP16)*/ 2);
++    *buffer =
++        PimCreateBo(rangeX, rangeY, rangeZ, 1, PIM_FP16, MEM_TYPE_PIM, pointer);
++    // The PimBo* created here must be destroyed later. As these temporary
++    // buffers is not associated with any pi_mem, we attach them to the kernel
++    // (pi_kernel::addPimBuffer), so they are destroyed when the kernel is
++    // released.
++    return true;
++  }
++  return false;
++}
++
++using pim_vector_op_t =
++    std::function<int(PimBo *, PimBo *, PimBo *, void *, bool)>;
++using pim_vector_op_ptr = int (*)(PimBo *, PimBo *, PimBo *, void *, bool);
++
++using pim_scalar_op_t =
++    std::function<int(PimBo *, void *, PimBo *, void *, bool)>;
++using pim_scalar_op_ptr = int (*)(PimBo *, void *, PimBo *, void *, bool);
++
++pi_result executeVecPIMOperation(pi_kernel kernel, pi_queue command_queue,
++                                 pim_vector_op_t operation) {
++  assert(kernel->get_num_args() == 21 &&
++         "Expecting 21 arguments for PIM vector operation");
++  auto arguments = kernel->get_arg_indices();
++  PimBo *output = nullptr;
++  if (getRangedBufferWithOffset(arguments, 0, &output)) {
++    kernel->addPimBuffer(output);
++  }
++  PimBo *operand0 = nullptr;
++  if (getRangedBufferWithOffset(arguments, 7, &operand0)) {
++    kernel->addPimBuffer(operand0);
++  }
++  PimBo *operand1 = nullptr;
++  if (getRangedBufferWithOffset(arguments, 14, &operand1)) {
++    kernel->addPimBuffer(operand1);
++  }
++  assert(output != nullptr);
++  assert(operand0 != nullptr);
++  assert(operand1 != nullptr);
++  return CHECK_PIM_ERROR(
++      operation(output, operand0, operand1, command_queue->get(), false));
++}
++
++pi_result executeScalarPIMOperation(pi_kernel kernel, pi_queue command_queue,
++                                    pim_scalar_op_t operation) {
++  assert(kernel->get_num_args() == 15 &&
++         "Expecting 15 arguments for PIM scalar operation");
++  auto arguments = kernel->get_arg_indices();
++  PimBo *output = nullptr;
++  if (getRangedBufferWithOffset(arguments, 0, &output)) {
++    kernel->addPimBuffer(output);
++  }
++  void *operand0 = *static_cast<void **>(arguments[7]);
++  PimBo *operand1 = nullptr;
++  if (getRangedBufferWithOffset(arguments, 8, &operand1)) {
++    kernel->addPimBuffer(operand1);
++  }
++  assert(output != nullptr);
++  assert(operand0 != nullptr);
++  assert(operand1 != nullptr);
++  return CHECK_PIM_ERROR(
++      operation(output, operand0, operand1, command_queue->get(), false));
++}
++
+ template <>
+ pi_result
+ executePIMOperation<pi_pim_kernel::PIM_KERNEL_VEC_ADD>(pi_kernel kernel,
+                                                        pi_queue command_queue) {
+-  assert(kernel->get_num_args() == 3 &&
+-         "Expecting three arguments for PIM vector + vector addition");
+-  auto arguments = kernel->get_arg_indices();
+-  PimBo *output = *static_cast<PimBo **>(arguments[0]);
+-  PimBo *operand0 = *static_cast<PimBo **>(arguments[1]);
+-  PimBo *operand1 = *static_cast<PimBo **>(arguments[2]);
+-  return CHECK_PIM_ERROR(
+-      PimExecuteAdd(output, operand0, operand1, command_queue->get(), false));
++  return executeVecPIMOperation(kernel, command_queue,
++                                static_cast<pim_vector_op_ptr>(PimExecuteAdd));
+ }
+ 
+ template <>
+ pi_result executePIMOperation<pi_pim_kernel::PIM_KERNEL_SCALAR_ADD>(
+     pi_kernel kernel, pi_queue command_queue) {
+-  assert(kernel->get_num_args() == 3 &&
+-         "Expecting three arguments for PIM vector + scalar addition");
+-  auto arguments = kernel->get_arg_indices();
+-  PimBo *output = *static_cast<PimBo **>(arguments[0]);
+-  void *operand0 = *static_cast<void **>(arguments[1]);
+-  PimBo *operand1 = *static_cast<PimBo **>(arguments[2]);
+-  return CHECK_PIM_ERROR(
+-      PimExecuteAdd(output, operand0, operand1, command_queue->get(), false));
++  return executeScalarPIMOperation(
++      kernel, command_queue, static_cast<pim_scalar_op_ptr>(PimExecuteAdd));
+ }
+ 
+ template <>
+ pi_result
+ executePIMOperation<pi_pim_kernel::PIM_KERNEL_VEC_MUL>(pi_kernel kernel,
+                                                        pi_queue command_queue) {
+-  assert(kernel->get_num_args() == 3 &&
+-         "Expecting three arguments for PIM vector * vector multiplication");
+-  auto arguments = kernel->get_arg_indices();
+-  PimBo *output = *static_cast<PimBo **>(arguments[0]);
+-  PimBo *operand0 = *static_cast<PimBo **>(arguments[1]);
+-  PimBo *operand1 = *static_cast<PimBo **>(arguments[2]);
+-  return CHECK_PIM_ERROR(
+-      PimExecuteMul(output, operand0, operand1, command_queue->get(), false));
++  return executeVecPIMOperation(kernel, command_queue,
++                                static_cast<pim_vector_op_ptr>(PimExecuteMul));
+ }
+ 
+ template <>
+ pi_result executePIMOperation<pi_pim_kernel::PIM_KERNEL_SCALAR_MUL>(
+     pi_kernel kernel, pi_queue command_queue) {
+-  assert(kernel->get_num_args() == 3 &&
+-         "Expecting three arguments for PIM vector * scalar multiplication");
+-  auto arguments = kernel->get_arg_indices();
+-  PimBo *output = *static_cast<PimBo **>(arguments[0]);
+-  void *operand0 = *static_cast<void **>(arguments[1]);
+-  PimBo *operand1 = *static_cast<PimBo **>(arguments[2]);
+-  return CHECK_PIM_ERROR(
+-      PimExecuteMul(output, operand0, operand1, command_queue->get(), false));
++  return executeScalarPIMOperation(
++      kernel, command_queue, static_cast<pim_scalar_op_ptr>(PimExecuteMul));
+ }
+ 
+ template <>
+ pi_result
+ executePIMOperation<pi_pim_kernel::PIM_KERNEL_GEMV>(pi_kernel kernel,
+                                                     pi_queue command_queue) {
+-  assert(kernel->get_num_args() == 3 &&
+-         "Expecting three arguments for PIM GEMV");
+-  auto arguments = kernel->get_arg_indices();
+-  PimBo *output = *static_cast<PimBo **>(arguments[0]);
+-  PimBo *operand0 = *static_cast<PimBo **>(arguments[1]);
+-  PimBo *operand1 = *static_cast<PimBo **>(arguments[2]);
+-  return CHECK_PIM_ERROR(
+-      PimExecuteGemv(output, operand0, operand1, command_queue->get(), false));
++  return executeVecPIMOperation(kernel, command_queue,
++                                static_cast<pim_vector_op_ptr>(PimExecuteGemv));
+ }
+ 
+ #define SELECT_PIM_OPERATION(operation, kernel, queue)                         \
+@@ -2520,51 +2580,6 @@ pi_result hip_piextContextCreateWithNativeHandle(pi_native_handle nativeHandle,
+ #ifdef __HIP_ENABLE_PIM__
+ namespace {
+ 
+-PimMemFlag translateMemFlag(pi_pim_mem_flag flag) {
+-  switch (flag) {
+-  case PI_PIM_ELT_OP:
+-    return PimMemFlag::ELT_OP;
+-  case PI_PIM_GEMV_INPUT:
+-    return PimMemFlag::GEMV_INPUT;
+-  case PI_PIM_GEMV_WEIGHT:
+-    return PimMemFlag::GEMV_WEIGHT;
+-  case PI_PIM_GEMV_OUTPUT:
+-    return PimMemFlag::GEMV_OUTPUT;
+-  case PI_PIM_GEMV_WEIGHT_T:
+-    return PimMemFlag::GEMV_WEIGHT_T;
+-  default:
+-    assert(false && "Unknown PIM mem flag");
+-  }
+-}
+-
+-PimOpType translateOpType(pi_pim_op_type ty) {
+-  switch (ty) {
+-  case PI_PIM_OP_GEMV:
+-    return PimOpType::OP_GEMV;
+-  case PI_PIM_OP_ELT_ADD:
+-    return PimOpType::OP_ELT_ADD;
+-  case PI_PIM_OP_ELT_MUL:
+-    return PimOpType::OP_ELT_MUL;
+-  case PI_PIM_OP_RELU:
+-    return PimOpType::OP_RELU;
+-  case PI_PIM_OP_BN:
+-    return PimOpType::OP_BN;
+-  case PI_PIM_OP_COPY:
+-    return PimOpType::OP_COPY;
+-  default:
+-    assert(false && "Unknown PIM operation type");
+-  }
+-}
+-
+-PimMemType getMemType(pi_pim_mem_flag flag) {
+-  if (flag == PI_PIM_ELT_OP) {
+-    return PimMemType::MEM_TYPE_PIM;
+-  } else {
+-    // Operands of GEMV need to be in device (GPU) memory, not in PIM memory.
+-    return PimMemType::MEM_TYPE_DEVICE;
+-  }
+-}
+-
+ pi_result createPIMBuffer(pi_context context, pi_mem_flags flags, size_t size,
+                           void *host_ptr, pi_mem *ret_mem,
+                           const pi_mem_properties *properties) {
+@@ -2578,8 +2593,6 @@ pi_result createPIMBuffer(pi_context context, pi_mem_flags flags, size_t size,
+   int w = -1;
+   int h = -1;
+   int c = -1;
+-  pi_mem_properties opTy = 0;
+-  pi_mem_properties memFlag = 0;
+ 
+   // Decode the properties. This list of properties is currently used to pass
+   // information about layout and operation type from SYCL to the PIM SDK here.
+@@ -2597,16 +2610,6 @@ pi_result createPIMBuffer(pi_context context, pi_mem_flags flags, size_t size,
+         assert(*properties != 0 && "Not enough values provided");
+         c = static_cast<int>(*properties);
+         ++properties;
+-      } else if (*properties == PI_MEM_PROPERTIES_PIM_MEM_FLAG) {
+-        ++properties;
+-        assert(*properties != 0 && "Not enough values provided");
+-        memFlag = *properties;
+-        ++properties;
+-      } else if (*properties == PI_MEM_PROPERTIES_PIM_OP_TYPE) {
+-        ++properties;
+-        assert(*properties != 0 && "Not enough values provided");
+-        opTy = *properties;
+-        ++properties;
+       } else {
+         assert(false && "Unsupported memory property");
+       }
+@@ -2631,34 +2634,20 @@ pi_result createPIMBuffer(pi_context context, pi_mem_flags flags, size_t size,
+   assert((!performInitialCopy || host_ptr) &&
+          "Need a valid host pointer for initial copy.");
+ 
+-  PimMemType pimMemTy = (memFlag)
+-                            ? getMemType(static_cast<pi_pim_mem_flag>(memFlag))
+-                            : PimMemType::MEM_TYPE_PIM;
+-  PimMemFlag pimMemFlag =
+-      (memFlag) ? translateMemFlag(static_cast<pi_pim_mem_flag>(memFlag))
+-                : PimMemFlag::ELT_OP; // Use element-wise operation as default.
+-  PimOpType pimOpTy = (opTy)
+-                          ? translateOpType(static_cast<pi_pim_op_type>(opTy))
+-                          : PimOpType::OP_DUMMY; // Use dummy op as default.
++  PimMemType pimMemTy = PimMemType::MEM_TYPE_PIM;
+   // Current prototype is fixed to FP16 only.
+-  PimPrecision pimPrec = PIM_FP16;
+   pi_result retErr = PI_SUCCESS;
+   pi_mem retMemObj = nullptr;
+   try {
+     ScopedContext active(context);
+     // Set n = 1 as long as there are no 4D buffers in SYCL.
+-    auto *pimDesc = PimCreateDesc(1, c, h, w, pimPrec, pimOpTy);
+-    if (!pimDesc) {
+-      return PI_PIM_SDK_ERROR;
+-    }
+     // If no user_ptr is given, this constructor will also allocate the
+     // necessary memory.
+-    auto *pimBo = PimCreateBo(pimDesc, pimMemTy, pimMemFlag);
++    auto *pimBo = PimCreateBo(w, h, c, 1, PIM_FP16, pimMemTy);
+     if (!pimBo) {
+       return PI_PIM_SDK_ERROR;
+     }
+ 
+-    CHECK_PIM_ERROR(PimDestroyDesc(pimDesc));
+     auto allocMode = _pi_mem::mem_::pim_mem_::alloc_mode::classic;
+     if (flags & PI_MEM_FLAGS_HOST_PTR_USE) {
+       allocMode = _pi_mem::mem_::pim_mem_::alloc_mode::use_host_ptr;
+@@ -2666,7 +2655,7 @@ pi_result createPIMBuffer(pi_context context, pi_mem_flags flags, size_t size,
+       allocMode = _pi_mem::mem_::pim_mem_::alloc_mode::copy_in;
+     }
+     auto piMemObj = std::unique_ptr<_pi_mem>(new _pi_mem{
+-        context, pimBo, pimOpTy, pimMemFlag, allocMode, host_ptr, size});
++        context, pimBo, allocMode, host_ptr, size});
+     if (piMemObj != nullptr) {
+       retMemObj = piMemObj.release();
+       if (performInitialCopy) {
+diff --git a/sycl/plugins/hip/pi_hip.hpp b/sycl/plugins/hip/pi_hip.hpp
+index 7b9a2bbe3648..279ad48f39d9 100644
+--- a/sycl/plugins/hip/pi_hip.hpp
++++ b/sycl/plugins/hip/pi_hip.hpp
+@@ -363,15 +363,9 @@ struct _pi_mem {
+         alloc_host_ptr
+       } allocMode_;
+ 
+-      /// The type of PIM operation this buffer is used for
+-      PimOpType opType_;
+-
+       /// Type of memory used by the PIM SDK for this buffer
+       PimMemType memType_;
+ 
+-      /// PIM-specific memory flag
+-      PimMemFlag memFlag_;
+-
+       native_type get_with_offset(size_t offset) const noexcept {
+         return reinterpret_cast<native_type>(reinterpret_cast<uint8_t *>(ptr_) +
+                                              offset);
+@@ -458,8 +452,8 @@ struct _pi_mem {
+ 
+ #ifdef __HIP_ENABLE_PIM__
+ 
+-  _pi_mem(pi_context ctxt, PimBo *bo, PimOpType opTy, PimMemFlag flag,
+-          mem_::pim_mem_::alloc_mode mode, void *host_ptr, size_t size)
++  _pi_mem(pi_context ctxt, PimBo *bo, mem_::pim_mem_::alloc_mode mode,
++          void *host_ptr, size_t size)
+       : context_{ctxt}, refCount_{1}, mem_type_{mem_type::pim} {
+     mem_.pim_mem_.bo_ = bo;
+     mem_.pim_mem_.ptr_ = bo->data;
+@@ -469,9 +463,7 @@ struct _pi_mem {
+     mem_.pim_mem_.mapPtr_ = nullptr;
+     mem_.pim_mem_.mapFlags_ = PI_MAP_WRITE;
+     mem_.pim_mem_.allocMode_ = mode;
+-    mem_.pim_mem_.opType_ = opTy;
+     mem_.pim_mem_.memType_ = bo->mem_type;
+-    mem_.pim_mem_.memFlag_ = flag;
+     hip_piContextRetain(context_);
+   }
+ 
+@@ -733,6 +725,9 @@ struct _pi_kernel {
+ 
+ #ifdef __HIP_ENABLE_PIM__
+   pi_pim_kernel pimKernel_ = PIM_KERNEL_NONE;
++
++  std::vector<PimBo *> pimBuffers_;
++
+ #endif // __HIP_ENABLE_PIM__
+ 
+   /// Structure that holds the arguments to the kernel.
+@@ -837,11 +832,19 @@ struct _pi_kernel {
+              pi_context ctxt)
+       : function_{nullptr}, functionWithOffsetParam_{nullptr}, name_{name},
+         context_{ctxt}, program_{program}, refCount_{1}, pimKernel_{kernel} {
++    hip_piProgramRetain(program);
+     hip_piContextRetain(context_);
+   }
+ #endif // __HIP_ENABLE_PIM__
+ 
+   ~_pi_kernel() {
++#ifdef __HIP_ENABLE_PIM__
++    for (auto *buffer : pimBuffers_) {
++      // Destroy any additional, temporary buffers associated with this kernel.
++      PimDestroyBo(buffer);
++    }
++#endif // __HIP_ENABLE_PIM__
++
+     hip_piProgramRelease(program_);
+     hip_piContextRelease(context_);
+   }
+@@ -896,6 +899,8 @@ struct _pi_kernel {
+ 
+ #ifdef __HIP_ENABLE_PIM__
+   bool is_pim_operation() { return pimKernel_ != PIM_KERNEL_NONE; }
++
++  void addPimBuffer(PimBo *buffer) { pimBuffers_.emplace_back(buffer); }
+ #endif // __HIP_ENABLE_PIM__
+ };
+ 
+diff --git a/sycl/source/detail/buffer_impl.cpp b/sycl/source/detail/buffer_impl.cpp
+index 02673bf239cb..72ae2b150f8d 100644
+--- a/sycl/source/detail/buffer_impl.cpp
++++ b/sycl/source/detail/buffer_impl.cpp
+@@ -20,7 +20,8 @@ namespace detail {
+ uint8_t GBufferStreamID;
+ #endif
+ void *buffer_impl::allocateMem(ContextImplPtr Context, bool InitFromUserData,
+-                               void *HostPtr, RT::PiEvent &OutEventToWait) {
++                               void *HostPtr, RT::PiEvent &OutEventToWait,
++                               sycl::range<3> BufferSize) {
+   bool HostPtrReadOnly = false;
+   BaseT::determineHostPtr(Context, InitFromUserData, HostPtr, HostPtrReadOnly);
+ 
+@@ -29,7 +30,7 @@ void *buffer_impl::allocateMem(ContextImplPtr Context, bool InitFromUserData,
+          "while having use_host_ptr property");
+   return MemoryManager::allocateMemBuffer(
+       std::move(Context), this, HostPtr, HostPtrReadOnly, BaseT::getSize(),
+-      BaseT::MInteropEvent, BaseT::MInteropContext, MProps, OutEventToWait);
++      BaseT::MInteropEvent, BaseT::MInteropContext, MProps, OutEventToWait, BufferSize);
+ }
+ void buffer_impl::constructorNotification(const detail::code_location &CodeLoc,
+                                           void *UserObj, const void *HostObj,
+diff --git a/sycl/source/detail/image_impl.cpp b/sycl/source/detail/image_impl.cpp
+index c4fbfa8dba28..20e529362f07 100644
+--- a/sycl/source/detail/image_impl.cpp
++++ b/sycl/source/detail/image_impl.cpp
+@@ -301,7 +301,9 @@ image_impl<Dimensions>::image_impl(
+ template <int Dimensions>
+ void *image_impl<Dimensions>::allocateMem(ContextImplPtr Context,
+                                           bool InitFromUserData, void *HostPtr,
+-                                          RT::PiEvent &OutEventToWait) {
++                                          RT::PiEvent &OutEventToWait,
++                                          sycl::range<3> ImageSize) {
++  (void)ImageSize;
+   bool HostPtrReadOnly = false;
+   BaseT::determineHostPtr(Context, InitFromUserData, HostPtr, HostPtrReadOnly);
+ 
+diff --git a/sycl/source/detail/memory_manager.cpp b/sycl/source/detail/memory_manager.cpp
+index 2a966439776c..fad092a6906b 100644
+--- a/sycl/source/detail/memory_manager.cpp
++++ b/sycl/source/detail/memory_manager.cpp
+@@ -271,14 +271,14 @@ void MemoryManager::releaseMemObj(ContextImplPtr TargetContext,
+ void *MemoryManager::allocate(ContextImplPtr TargetContext, SYCLMemObjI *MemObj,
+                               bool InitFromUserData, void *HostPtr,
+                               std::vector<EventImplPtr> DepEvents,
+-                              RT::PiEvent &OutEvent) {
++                              RT::PiEvent &OutEvent, sycl::range<3> MemSize) {
+   // There is no async API for memory allocation. Explicitly wait for all
+   // dependency events and return empty event.
+   waitForEvents(DepEvents);
+   OutEvent = nullptr;
+ 
+-  return MemObj->allocateMem(TargetContext, InitFromUserData, HostPtr,
+-                             OutEvent);
++  return MemObj->allocateMem(TargetContext, InitFromUserData, HostPtr, OutEvent,
++                             MemSize);
+ }
+ 
+ void *MemoryManager::wrapIntoImageBuffer(ContextImplPtr TargetContext,
+@@ -350,10 +350,11 @@ void *MemoryManager::allocateImageObject(ContextImplPtr TargetContext,
+   return NewMem;
+ }
+ 
+-void *
+-MemoryManager::allocateBufferObject(ContextImplPtr TargetContext, void *UserPtr,
+-                                    bool HostPtrReadOnly, const size_t Size,
+-                                    const sycl::property_list &PropsList) {
++void *MemoryManager::allocateBufferObject(ContextImplPtr TargetContext,
++                                          void *UserPtr, bool HostPtrReadOnly,
++                                          const size_t Size,
++                                          const sycl::property_list &PropsList,
++                                          sycl::range<3> BufferSize) {
+   RT::PiMemFlags CreationFlags =
+       getMemObjCreationFlags(UserPtr, HostPtrReadOnly);
+   if (PropsList.has_property<
+@@ -374,18 +375,28 @@ MemoryManager::allocateBufferObject(ContextImplPtr TargetContext, void *UserPtr,
+                             CreationFlags, Size, UserPtr, &NewMem, props);
+       return NewMem;
+     }
++  if (TargetContext->getDevices().front().has(aspect::ext_samsung_pim)) {
++    // At the time of writing, PIM devices in the HIP platform will always be a
++    // single device per context.
++    // We only pass the properties for PIM devices, because other PIs/devices do
++    // not expect to receive any properties and would throw errors/assertions.
++    pi_mem_properties props[5] = {PI_MEM_PROPERTIES_PIM_DIMENSIONS,
++                                  BufferSize.get(0), BufferSize.get(1),
++                                  BufferSize.get(2), 0};
++    memBufferCreateHelper(Plugin, TargetContext->getHandleRef(), CreationFlags,
++                          Size, UserPtr, &NewMem, props);
++    return NewMem;
++  }
+   memBufferCreateHelper(Plugin, TargetContext->getHandleRef(), CreationFlags,
+                         Size, UserPtr, &NewMem, nullptr);
+   return NewMem;
+ }
+ 
+-void *MemoryManager::allocateMemBuffer(ContextImplPtr TargetContext,
+-                                       SYCLMemObjI *MemObj, void *UserPtr,
+-                                       bool HostPtrReadOnly, size_t Size,
+-                                       const EventImplPtr &InteropEvent,
+-                                       const ContextImplPtr &InteropContext,
+-                                       const sycl::property_list &PropsList,
+-                                       RT::PiEvent &OutEventToWait) {
++void *MemoryManager::allocateMemBuffer(
++    ContextImplPtr TargetContext, SYCLMemObjI *MemObj, void *UserPtr,
++    bool HostPtrReadOnly, size_t Size, const EventImplPtr &InteropEvent,
++    const ContextImplPtr &InteropContext, const sycl::property_list &PropsList,
++    RT::PiEvent &OutEventToWait, sycl::range<3> BufferSize) {
+   void *MemPtr;
+   if (TargetContext->is_host())
+     MemPtr =
+@@ -396,7 +407,7 @@ void *MemoryManager::allocateMemBuffer(ContextImplPtr TargetContext,
+                                  InteropContext, PropsList, OutEventToWait);
+   else
+     MemPtr = allocateBufferObject(TargetContext, UserPtr, HostPtrReadOnly, Size,
+-                                  PropsList);
++                                  PropsList, BufferSize);
+   XPTIRegistry::bufferAssociateNotification(MemObj, MemPtr);
+   return MemPtr;
+ }
+diff --git a/sycl/source/detail/scheduler/commands.cpp b/sycl/source/detail/scheduler/commands.cpp
+index 6f32df034080..496be3770efc 100644
+--- a/sycl/source/detail/scheduler/commands.cpp
++++ b/sycl/source/detail/scheduler/commands.cpp
+@@ -915,9 +915,13 @@ cl_int AllocaCommand::enqueueImp() {
+   }
+   // TODO: Check if it is correct to use std::move on stack variable and
+   // delete it RawEvents below.
++
++  // Make sure that the range we pass on is always {width, height, depth}.
++  auto BufferSize = ::sycl::detail::convertRangeToXYZ(MRequirement.MMemoryRange,
++                                                      MRequirement.MDims);
+   MMemAllocation = MemoryManager::allocate(
+       MQueue->getContextImplPtr(), getSYCLMemObj(), MInitFromUserData, HostPtr,
+-      std::move(EventImpls), Event);
++      std::move(EventImpls), Event, BufferSize);
+ 
+   return CL_SUCCESS;
+ }
+@@ -2599,18 +2603,55 @@ pi_result ExecCGCommand::LaunchPimOperation(
+          "PIM operations only supported on HIP backend");
+ 
+   auto ContextImpl = Queue->getContextImplPtr();
+-  RT::PiProgram DummyProgram = nullptr;
+-  Plugin.call<PiApiKind::piProgramCreate>(ContextImpl->getHandleRef(), nullptr,
+-                                          0, &DummyProgram);
++  auto &KernelCache = ContextImpl->getKernelProgramCache();
+ 
+-  auto KernelIdentifier = translatePimOpType(Op);
+-  if (KernelIdentifier.empty()) {
+-    return PI_INVALID_OPERATION;
++  // Get the dummy program used to initialize the kernels to which arguments are
++  // then attached. Either use the existing the single program in the cache or
++  // create a new one.
++  RT::PiProgram DummyProgram = nullptr;
++  {
++    auto LockedProgramCache = KernelCache.acquireCachedPrograms();
++    auto ProgramKey = std::make_pair(
++        std::make_pair(
++            /*No spec constants required*/ std::vector<unsigned char>{},
++            /* KernelSetId is ignored */ 0),
++        std::make_pair(/* Device is ignored */ nullptr, "PIM"));
++    if (LockedProgramCache.get().empty()) {
++      // No dummy program for PIM kernels created so far, create a new one.
++      Plugin.call<PiApiKind::piProgramCreate>(ContextImpl->getHandleRef(),
++                                              nullptr, 0, &DummyProgram);
++      LockedProgramCache.get().emplace(std::piecewise_construct,
++                                       std::forward_as_tuple(ProgramKey),
++                                       std::forward_as_tuple(DummyProgram, 1));
++    } else {
++      DummyProgram = LockedProgramCache.get().at(ProgramKey).Ptr.load();
++    }
+   }
++  assert(DummyProgram != nullptr);
+ 
++  // Create a new PI kernel. This is not an actual kernel that gets executed,
++  // but rather a container for arguments and information about which operation
++  // to execute. The kernel is added to the cache to manage the lifetime
++  // attached to it.
+   RT::PiKernel OpKernel = nullptr;
+-  Plugin.call<detail::PiApiKind::piKernelCreate>(
+-      DummyProgram, KernelIdentifier.c_str(), &OpKernel);
++  {
++    static size_t KernelID = 0;
++    auto LockedCache = KernelCache.acquireKernelsPerProgramCache();
++
++    auto KernelIdentifier = translatePimOpType(Op);
++    if (KernelIdentifier.empty()) {
++      return PI_INVALID_OPERATION;
++    }
++
++    Plugin.call<detail::PiApiKind::piKernelCreate>(
++        DummyProgram, KernelIdentifier.c_str(), &OpKernel);
++
++    LockedCache.get()[DummyProgram].emplace(
++        std::piecewise_construct,
++        /*Create a unique name as key for the cache*/
++        std::forward_as_tuple("pim_kernel_" + std::to_string(KernelID++)),
++        std::forward_as_tuple(OpKernel, 1));
++  }
+ 
+   auto setFunc = [&Plugin, OpKernel,
+                   &getMemAllocationFunc](detail::ArgDesc &Arg) {
+@@ -2656,10 +2697,6 @@ pi_result ExecCGCommand::LaunchPimOperation(
+           Queue->getHandleRef(), OpKernel, 0, nullptr, nullptr, nullptr,
+           RawEvents.size(), RawEvents.empty() ? nullptr : &RawEvents[0],
+           OutEvent);
+-
+-  // Because the kernels here are just container for arguments, it's safe to
+-  // release the kernel created above here.
+-  Plugin.call<detail::PiApiKind::piKernelRelease>(OpKernel);
+   return Error;
+ }
+ 
+diff --git a/sycl/test/abi/vtable.cpp b/sycl/test/abi/vtable.cpp
+index 44aa731cf582..823e40f0ad1c 100644
+--- a/sycl/test/abi/vtable.cpp
++++ b/sycl/test/abi/vtable.cpp
+@@ -32,7 +32,7 @@ void foo(sycl::detail::SYCLMemObjI &MemObj) { (void)MemObj.getType(); }
+ // CHECK-NEXT:   2 | sycl::detail::SYCLMemObjI::~SYCLMemObjI() [complete]
+ // CHECK-NEXT:   3 | sycl::detail::SYCLMemObjI::~SYCLMemObjI() [deleting]
+ // CHECK-NEXT:   4 | sycl::detail::SYCLMemObjI::MemObjType sycl::detail::SYCLMemObjI::getType() const [pure]
+-// CHECK-NEXT:   5 | void *sycl::detail::SYCLMemObjI::allocateMem(sycl::detail::ContextImplPtr, bool, void *, RT::PiEvent &) [pure]
++// CHECK-NEXT:   5 | void *sycl::detail::SYCLMemObjI::allocateMem(sycl::detail::ContextImplPtr, bool, void *, RT::PiEvent &, sycl::range<3>) [pure]
+ // CHECK-NEXT:   6 | void *sycl::detail::SYCLMemObjI::allocateHostMem() [pure]
+ // CHECK-NEXT:   7 | void sycl::detail::SYCLMemObjI::releaseMem(sycl::detail::ContextImplPtr, void *) [pure]
+ // CHECK-NEXT:   8 | void sycl::detail::SYCLMemObjI::releaseHostMem(void *) [pure]
+diff --git a/sycl/unittests/pi/pim/pim_test_utils.hpp b/sycl/unittests/pi/pim/pim_test_utils.hpp
+index fed8b8889b70..8c023130db68 100644
+--- a/sycl/unittests/pi/pim/pim_test_utils.hpp
++++ b/sycl/unittests/pi/pim/pim_test_utils.hpp
+@@ -67,14 +67,10 @@ inline pi_platform findPIMPlatform(sycl::detail::plugin &plugin) {
+ }
+ 
+ inline auto getMemProperties() {
+-  return std::array<pi_mem_properties, 9>{PI_MEM_PROPERTIES_PIM_DIMENSIONS,
++  return std::array<pi_mem_properties, 5>{PI_MEM_PROPERTIES_PIM_DIMENSIONS,
+                                           16,
+                                           8,
+                                           4,
+-                                          PI_MEM_PROPERTIES_PIM_MEM_FLAG,
+-                                          pi_pim_mem_flag::PI_PIM_ELT_OP,
+-                                          PI_MEM_PROPERTIES_PIM_OP_TYPE,
+-                                          pi_pim_op_type::PI_PIM_OP_ELT_ADD,
+                                           0};
+ }
+ } // namespace detail
+diff --git a/sycl/unittests/pi/pim/test_pim_mem_obj.cpp b/sycl/unittests/pi/pim/test_pim_mem_obj.cpp
+index 10f75ccb409e..53725f5df550 100644
+--- a/sycl/unittests/pi/pim/test_pim_mem_obj.cpp
++++ b/sycl/unittests/pi/pim/test_pim_mem_obj.cpp
+@@ -397,15 +397,11 @@ TEST_F(PimTestMemObj, piCommonPIMCopyRect) {
+   std::array<sycl::half, numElements *numElements> hostData = {
+       42, 42, 1, 1, 42, 42, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+ 
+-  std::array<pi_mem_properties, 9> memProperties = {
++  std::array<pi_mem_properties, 5> memProperties = {
+       PI_MEM_PROPERTIES_PIM_DIMENSIONS,
+       numElements,
+       numElements,
+       1,
+-      PI_MEM_PROPERTIES_PIM_MEM_FLAG,
+-      pi_pim_mem_flag::PI_PIM_ELT_OP,
+-      PI_MEM_PROPERTIES_PIM_OP_TYPE,
+-      pi_pim_op_type::PI_PIM_OP_ELT_ADD,
+       0};
+ 
+   pi_mem buf1;
+diff --git a/sycl/unittests/pi/pim/test_pim_operations.cpp b/sycl/unittests/pi/pim/test_pim_operations.cpp
+index a9d5aec2b547..a2a671fa34c8 100644
+--- a/sycl/unittests/pi/pim/test_pim_operations.cpp
++++ b/sycl/unittests/pi/pim/test_pim_operations.cpp
+@@ -79,6 +79,14 @@ protected:
+ using pim::detail::getMemProperties;
+ 
+ TEST_F(PimTestOperations, pimVectorAddOperation) {
++  size_t W = 16;
++  size_t H = 8;
++  size_t C = 4;
++  size_t Offset = 0;
++  auto *W_ptr = &W;
++  auto *H_ptr = &H;
++  auto *C_ptr = &C;
++  auto *O_ptr = &Offset;
+   pi_program dummyProgram = nullptr;
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piProgramCreate>(
+                 context_, nullptr, 0, &dummyProgram)),
+@@ -120,13 +128,87 @@ TEST_F(PimTestOperations, pimVectorAddOperation) {
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+                 opKernel, 0, &outputBuf)),
+             PI_SUCCESS);
++  // Pass the width of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 1, sizeof(sycl::half *), &W_ptr)),
++            PI_SUCCESS);
++  // Pass the height of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 2, sizeof(sycl::half *), &H_ptr)),
++            PI_SUCCESS);
++  // Pass the depth of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 3, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass X component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 4, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Y component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 5, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Z component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 6, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+-                opKernel, 1, &inputBuf1)),
++                opKernel, 7, &inputBuf1)),
++            PI_SUCCESS);
++
++  // Pass the width of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 8, sizeof(sycl::half *), &W_ptr)),
++            PI_SUCCESS);
++  // Pass the height of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 9, sizeof(sycl::half *), &H_ptr)),
++            PI_SUCCESS);
++  // Pass the depth of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 10, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass X component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 11, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Y component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 12, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Z component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 13, sizeof(sycl::half *), &O_ptr)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+-                opKernel, 2, &inputBuf2)),
++                opKernel, 14, &inputBuf2)),
++            PI_SUCCESS);
++
++  // Pass the width of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 15, sizeof(sycl::half *), &W_ptr)),
++            PI_SUCCESS);
++  // Pass the height of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 16, sizeof(sycl::half *), &H_ptr)),
++            PI_SUCCESS);
++  // Pass the depth of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 17, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass X component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 18, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Y component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 19, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Z component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 20, sizeof(sycl::half *), &O_ptr)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ(
+@@ -152,12 +234,24 @@ TEST_F(PimTestOperations, pimVectorAddOperation) {
+       (plugin->call_nocheck<detail::PiApiKind::piKernelRelease>(opKernel)),
+       PI_SUCCESS);
+ 
++  ASSERT_EQ(
++      (plugin->call_nocheck<detail::PiApiKind::piProgramRelease>(dummyProgram)),
++      PI_SUCCESS);
++
+   for (size_t i = 0; i < output.size(); ++i) {
+     ASSERT_EQ(output[i], static_cast<sycl::half>(3 * i));
+   }
+ }
+ 
+ TEST_F(PimTestOperations, pimVectorMulOperation) {
++  size_t W = 16;
++  size_t H = 8;
++  size_t C = 4;
++  size_t Offset = 0;
++  auto *W_ptr = &W;
++  auto *H_ptr = &H;
++  auto *C_ptr = &C;
++  auto *O_ptr = &Offset;
+   pi_program dummyProgram = nullptr;
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piProgramCreate>(
+                 context_, nullptr, 0, &dummyProgram)),
+@@ -201,12 +295,87 @@ TEST_F(PimTestOperations, pimVectorMulOperation) {
+                 opKernel, 0, &outputBuf)),
+             PI_SUCCESS);
+ 
++  // Pass the width of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 1, sizeof(sycl::half *), &W_ptr)),
++            PI_SUCCESS);
++  // Pass the height of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 2, sizeof(sycl::half *), &H_ptr)),
++            PI_SUCCESS);
++  // Pass the depth of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 3, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass X component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 4, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Y component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 5, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Z component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 6, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+-                opKernel, 1, &inputBuf1)),
++                opKernel, 7, &inputBuf1)),
++            PI_SUCCESS);
++
++  // Pass the width of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 8, sizeof(sycl::half *), &W_ptr)),
++            PI_SUCCESS);
++  // Pass the height of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 9, sizeof(sycl::half *), &H_ptr)),
++            PI_SUCCESS);
++  // Pass the depth of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 10, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass X component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 11, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Y component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 12, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Z component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 13, sizeof(sycl::half *), &O_ptr)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+-                opKernel, 2, &inputBuf2)),
++                opKernel, 14, &inputBuf2)),
++            PI_SUCCESS);
++
++  // Pass the width of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 15, sizeof(sycl::half *), &W_ptr)),
++            PI_SUCCESS);
++  // Pass the height of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 16, sizeof(sycl::half *), &H_ptr)),
++            PI_SUCCESS);
++  // Pass the depth of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 17, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass X component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 18, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Y component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 19, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Z component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 20, sizeof(sycl::half *), &O_ptr)),
+             PI_SUCCESS);
+   pi_event event;
+   ASSERT_EQ(
+@@ -234,12 +403,24 @@ TEST_F(PimTestOperations, pimVectorMulOperation) {
+       (plugin->call_nocheck<detail::PiApiKind::piKernelRelease>(opKernel)),
+       PI_SUCCESS);
+ 
++  ASSERT_EQ(
++      (plugin->call_nocheck<detail::PiApiKind::piProgramRelease>(dummyProgram)),
++      PI_SUCCESS);
++
+   for (size_t i = 0; i < output.size(); ++i) {
+     ASSERT_EQ(output[i], static_cast<sycl::half>(2 * (i % 36) * (i % 39)));
+   }
+ }
+ 
+ TEST_F(PimTestOperations, pimScalarAddOperation) {
++  size_t W = 16;
++  size_t H = 8;
++  size_t C = 4;
++  size_t Offset = 0;
++  auto *W_ptr = &W;
++  auto *H_ptr = &H;
++  auto *C_ptr = &C;
++  auto *O_ptr = &Offset;
+   pi_program dummyProgram = nullptr;
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piProgramCreate>(
+                 context_, nullptr, 0, &dummyProgram)),
+@@ -278,12 +459,62 @@ TEST_F(PimTestOperations, pimScalarAddOperation) {
+                 opKernel, 0, &outputBuf)),
+             PI_SUCCESS);
+ 
++  // Pass the width of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 1, sizeof(sycl::half *), &W_ptr)),
++            PI_SUCCESS);
++  // Pass the height of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 2, sizeof(sycl::half *), &H_ptr)),
++            PI_SUCCESS);
++  // Pass the depth of the accessor.
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 1, sizeof(sycl::half *), &scalarArg)),
++                opKernel, 3, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass X component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 4, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Y component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 5, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Z component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 6, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 7, sizeof(sycl::half *), &scalarArg)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+-                opKernel, 2, &inputBuf)),
++                opKernel, 8, &inputBuf)),
++            PI_SUCCESS);
++
++  // Pass the width of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 9, sizeof(sycl::half *), &W_ptr)),
++            PI_SUCCESS);
++  // Pass the height of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 10, sizeof(sycl::half *), &H_ptr)),
++            PI_SUCCESS);
++  // Pass the depth of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 11, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass X component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 12, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Y component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 13, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Z component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 14, sizeof(sycl::half *), &O_ptr)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ(
+@@ -306,12 +537,24 @@ TEST_F(PimTestOperations, pimScalarAddOperation) {
+       (plugin->call_nocheck<detail::PiApiKind::piKernelRelease>(opKernel)),
+       PI_SUCCESS);
+ 
++  ASSERT_EQ(
++      (plugin->call_nocheck<detail::PiApiKind::piProgramRelease>(dummyProgram)),
++      PI_SUCCESS);
++
+   for (size_t i = 0; i < output.size(); ++i) {
+     ASSERT_EQ(output[i], static_cast<sycl::half>(i + 5));
+   }
+ }
+ 
+ TEST_F(PimTestOperations, pimScalarMulOperation) {
++  size_t W = 16;
++  size_t H = 8;
++  size_t C = 4;
++  size_t Offset = 0;
++  auto *W_ptr = &W;
++  auto *H_ptr = &H;
++  auto *C_ptr = &C;
++  auto *O_ptr = &Offset;
+   pi_program dummyProgram = nullptr;
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piProgramCreate>(
+                 context_, nullptr, 0, &dummyProgram)),
+@@ -350,12 +593,62 @@ TEST_F(PimTestOperations, pimScalarMulOperation) {
+                 opKernel, 0, &outputBuf)),
+             PI_SUCCESS);
+ 
++  // Pass the width of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 1, sizeof(sycl::half *), &W_ptr)),
++            PI_SUCCESS);
++  // Pass the height of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 2, sizeof(sycl::half *), &H_ptr)),
++            PI_SUCCESS);
++  // Pass the depth of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 3, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass X component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 4, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Y component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 5, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Z component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 6, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
+-                opKernel, 1, sizeof(sycl::half *), &scalarArg)),
++                opKernel, 7, sizeof(sycl::half *), &scalarArg)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+-                opKernel, 2, &inputBuf)),
++                opKernel, 8, &inputBuf)),
++            PI_SUCCESS);
++
++  // Pass the width of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 9, sizeof(sycl::half *), &W_ptr)),
++            PI_SUCCESS);
++  // Pass the height of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 10, sizeof(sycl::half *), &H_ptr)),
++            PI_SUCCESS);
++  // Pass the depth of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 11, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass X component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 12, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Y component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 13, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Z component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 14, sizeof(sycl::half *), &O_ptr)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ(
+@@ -378,6 +671,10 @@ TEST_F(PimTestOperations, pimScalarMulOperation) {
+       (plugin->call_nocheck<detail::PiApiKind::piKernelRelease>(opKernel)),
+       PI_SUCCESS);
+ 
++  ASSERT_EQ(
++      (plugin->call_nocheck<detail::PiApiKind::piProgramRelease>(dummyProgram)),
++      PI_SUCCESS);
++
+   for (size_t i = 0; i < output.size(); ++i) {
+     ASSERT_EQ(output[i], static_cast<sycl::half>(i * 2));
+   }
+@@ -386,6 +683,12 @@ TEST_F(PimTestOperations, pimScalarMulOperation) {
+ TEST_F(PimTestOperations, pimGEMVOperation) {
+   constexpr size_t M = 4096;
+   constexpr size_t N = 256;
++  constexpr size_t C = 1;
++  constexpr size_t Offset = 0;
++  auto *M_ptr = &M;
++  auto *N_ptr = &N;
++  auto *C_ptr = &C;
++  auto *O_ptr = &Offset;
+   std::string dataDir{__PIM_MATRIX_DATA__};
+   std::array<sycl::half, M * N> matrix;
+   ASSERT_TRUE(pim::detail::readFromFile(dataDir + "mat.data", matrix.data(),
+@@ -398,16 +701,8 @@ TEST_F(PimTestOperations, pimGEMVOperation) {
+   ASSERT_TRUE(pim::detail::readFromFile(dataDir + "out.data", reference.data(),
+                                         reference.size()));
+ 
+-  std::array<pi_mem_properties, 9> matrixProperties{
+-      PI_MEM_PROPERTIES_PIM_DIMENSIONS,
+-      N,
+-      M,
+-      1,
+-      PI_MEM_PROPERTIES_PIM_MEM_FLAG,
+-      pi_pim_mem_flag::PI_PIM_GEMV_WEIGHT,
+-      PI_MEM_PROPERTIES_PIM_OP_TYPE,
+-      pi_pim_op_type::PI_PIM_OP_GEMV,
+-      0};
++  std::array<pi_mem_properties, 5> matrixProperties{
++      PI_MEM_PROPERTIES_PIM_DIMENSIONS, N, M, C, 0};
+ 
+   pi_mem matrixBuf;
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
+@@ -416,16 +711,8 @@ TEST_F(PimTestOperations, pimGEMVOperation) {
+                 matrixProperties.data())),
+             PI_SUCCESS);
+ 
+-  std::array<pi_mem_properties, 9> vectorProperties{
+-      PI_MEM_PROPERTIES_PIM_DIMENSIONS,
+-      N,
+-      1,
+-      1,
+-      PI_MEM_PROPERTIES_PIM_MEM_FLAG,
+-      pi_pim_mem_flag::PI_PIM_GEMV_INPUT,
+-      PI_MEM_PROPERTIES_PIM_OP_TYPE,
+-      pi_pim_op_type::PI_PIM_OP_GEMV,
+-      0};
++  std::array<pi_mem_properties, 5> vectorProperties{
++      PI_MEM_PROPERTIES_PIM_DIMENSIONS, N, C, C, 0};
+ 
+   pi_mem vectorBuf;
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
+@@ -434,16 +721,8 @@ TEST_F(PimTestOperations, pimGEMVOperation) {
+                 vectorProperties.data())),
+             PI_SUCCESS);
+ 
+-  std::array<pi_mem_properties, 9> outputProperties{
+-      PI_MEM_PROPERTIES_PIM_DIMENSIONS,
+-      M,
+-      1,
+-      1,
+-      PI_MEM_PROPERTIES_PIM_MEM_FLAG,
+-      pi_pim_mem_flag::PI_PIM_GEMV_OUTPUT,
+-      PI_MEM_PROPERTIES_PIM_OP_TYPE,
+-      pi_pim_op_type::PI_PIM_OP_GEMV,
+-      0};
++  std::array<pi_mem_properties, 5> outputProperties{
++      PI_MEM_PROPERTIES_PIM_DIMENSIONS, M, C, C, 0};
+ 
+   pi_mem outputBuf;
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piMemBufferCreate>(
+@@ -467,12 +746,87 @@ TEST_F(PimTestOperations, pimGEMVOperation) {
+                 opKernel, 0, &outputBuf)),
+             PI_SUCCESS);
+ 
++  // Pass the width of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 1, sizeof(sycl::half *), &M_ptr)),
++            PI_SUCCESS);
++  // Pass the height of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 2, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass the depth of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 3, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass X component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 4, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Y component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 5, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Z component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 6, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+-                opKernel, 1, &vectorBuf)),
++                opKernel, 7, &vectorBuf)),
++            PI_SUCCESS);
++
++  // Pass the width of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 8, sizeof(sycl::half *), &N_ptr)),
++            PI_SUCCESS);
++  // Pass the height of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 9, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass the depth of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 10, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass X component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 11, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Y component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 12, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Z component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 13, sizeof(sycl::half *), &O_ptr)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piextKernelSetArgMemObj>(
+-                opKernel, 2, &matrixBuf)),
++                opKernel, 14, &matrixBuf)),
++            PI_SUCCESS);
++
++  // Pass the width of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 15, sizeof(sycl::half *), &N_ptr)),
++            PI_SUCCESS);
++  // Pass the height of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 16, sizeof(sycl::half *), &M_ptr)),
++            PI_SUCCESS);
++  // Pass the depth of the accessor.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 17, sizeof(sycl::half *), &C_ptr)),
++            PI_SUCCESS);
++  // Pass X component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 18, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Y component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 19, sizeof(sycl::half *), &O_ptr)),
++            PI_SUCCESS);
++  // Pass Z component of offset.
++  ASSERT_EQ((plugin->call_nocheck<detail::PiApiKind::piKernelSetArg>(
++                opKernel, 20, sizeof(sycl::half *), &O_ptr)),
+             PI_SUCCESS);
+ 
+   ASSERT_EQ(
+@@ -498,6 +852,10 @@ TEST_F(PimTestOperations, pimGEMVOperation) {
+       (plugin->call_nocheck<detail::PiApiKind::piKernelRelease>(opKernel)),
+       PI_SUCCESS);
+ 
++  ASSERT_EQ(
++      (plugin->call_nocheck<detail::PiApiKind::piProgramRelease>(dummyProgram)),
++      PI_SUCCESS);
++
+   for (size_t i = 0; i < M; ++i) {
+     ASSERT_EQ(reference[i], output[i]);
+   }
+diff --git a/sycl/unittests/scheduler/LinkedAllocaDependencies.cpp b/sycl/unittests/scheduler/LinkedAllocaDependencies.cpp
+index 4864bcf4aa2f..8d167286e229 100644
+--- a/sycl/unittests/scheduler/LinkedAllocaDependencies.cpp
++++ b/sycl/unittests/scheduler/LinkedAllocaDependencies.cpp
+@@ -25,7 +25,7 @@ public:
+   MemObjType getType() const override { return MemObjType::Buffer; }
+ 
+   void *allocateMem(ContextImplPtr, bool, void *,
+-                    cl::sycl::detail::pi::PiEvent &) {
++                    cl::sycl::detail::pi::PiEvent &, sycl::range<3>) {
+     return nullptr;
+   }
+ 
+-- 
+2.17.1
+

@@ -1,0 +1,84 @@
+From f4174622834892bcfb2c73042e4dc7579695eb94 Mon Sep 17 00:00:00 2001
+From: "hyesun.hong" <hyesun.hong@samsung.com>
+Date: Tue, 29 Nov 2022 21:03:59 +0900
+Subject: [PATCH 16/17] Adjust patch
+
+---
+ sycl/plugins/hip/pi_hip.cpp               | 21 +++++++++++++++++++++
+ sycl/source/detail/scheduler/commands.cpp |  7 ++-----
+ 2 files changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/sycl/plugins/hip/pi_hip.cpp b/sycl/plugins/hip/pi_hip.cpp
+index 6808d74babff..e76b7f0fdc97 100644
+--- a/sycl/plugins/hip/pi_hip.cpp
++++ b/sycl/plugins/hip/pi_hip.cpp
+@@ -250,6 +250,16 @@ bool getRangedBufferWithOffset(const std::vector<void *> &arguments,
+   auto shape = (*buffer)->bshape;
+   if (offsetX || offsetY || offsetZ || shape.w != rangeX || shape.h != rangeY ||
+       shape.c != rangeZ) {
++    if ((offsetX + rangeX) > shape.w || (offsetY + rangeY) > shape.h ||
++        (offsetZ + rangeZ) > shape.c) {
++      std::cerr << "Out-of-range on PimBo:\n";
++      std::cerr << "w: " << offsetX << "+" << rangeX << " vs " << shape.w
++                << "\n";
++      std::cerr << "h: " << offsetY << "+" << rangeY << " vs " << shape.h
++                << "\n";
++      std::cerr << "c: " << offsetZ << "+" << rangeZ << " vs " << shape.c
++                << "\n";
++    }
+     assert((offsetX + rangeX) <= shape.w && "PIM buffer access out-of-range");
+     assert((offsetY + rangeY) <= shape.h && "PIM buffer access out-of-range");
+     assert((offsetZ + rangeZ) <= shape.c && "PIM buffer access out-of-range");
+@@ -2655,6 +2665,17 @@ pi_result createPIMBuffer(pi_context context, pi_mem_flags flags, size_t size,
+     if (!pimBo) {
+       return PI_PIM_SDK_ERROR;
+     }
++    auto &boShape = pimBo->bshape;
++    if (boShape.w != static_cast<unsigned>(w) ||
++        boShape.h != static_cast<unsigned>(h) ||
++        boShape.c != static_cast<unsigned>(c) || boShape.n != 1) {
++      std::cerr << "Size mismatch for PimBo:\n";
++      std::cerr << "w: " << boShape.w << " vs " << w << "\n";
++      std::cerr << "h: " << boShape.h << " vs " << h << "\n";
++      std::cerr << "w: " << boShape.c << " vs " << c << "\n";
++      std::cerr << "w: " << boShape.n << " vs " << 1 << "\n";
++      return PI_INVALID_MEM_OBJECT;
++    }
+ 
+     auto allocMode = _pi_mem::mem_::pim_mem_::alloc_mode::classic;
+     if (flags & PI_MEM_FLAGS_HOST_PTR_USE) {
+diff --git a/sycl/source/detail/scheduler/commands.cpp b/sycl/source/detail/scheduler/commands.cpp
+index 4ab862080ab0..2e4fcccb966c 100644
+--- a/sycl/source/detail/scheduler/commands.cpp
++++ b/sycl/source/detail/scheduler/commands.cpp
+@@ -2676,6 +2676,7 @@ pi_result ExecCGCommand::LaunchPimOperation(
+     if (CachedKernel != Cache.end()) {
+       OpKernel = CachedKernel->second.Ptr.load();
+       KernelCacheHit = true;
++      std::cout << "Cache hit with " << KernelIdentifier << "\n";
+     } else {
+       Plugin.call<detail::PiApiKind::piKernelCreate>(
+           DummyProgram, PimOpType.c_str(), &OpKernel);
+@@ -2684,6 +2685,7 @@ pi_result ExecCGCommand::LaunchPimOperation(
+                     std::forward_as_tuple(KernelIdentifier),
+                     std::forward_as_tuple(OpKernel, 1));
+       KernelCacheHit = false;
++      std::cout << "Cache miss with " << KernelIdentifier << "\n";
+     }
+   }
+   assert(OpKernel != nullptr);
+@@ -2760,11 +2762,6 @@ std::string ExecCGCommand::getPIMKernelIdentifier(
+     switch (Arg.MType) {
+     case kernel_param_kind_t::kind_accessor: {
+       auto *Req = static_cast<Requirement *>(Arg.MPtr);
+-      assert(getMemAllocationFunc != nullptr && "The function should not "
+-                                                "be nullptr as we "
+-                                                "followed the path for "
+-                                                "which accessors are "
+-                                                "used");
+       Identifier << "_" << static_cast<SYCLMemObjT*>(Req->MSYCLMemObj)->getID();
+       break;
+     }
+-- 
+2.17.1
+
