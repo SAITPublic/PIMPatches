@@ -30,11 +30,24 @@ make -j
 sudo make install
 ```
 
-
 ### DPCPP
-After HIP installaiton, yu need to setup ROCT and PIMLibrary again. 
+After HIP installaiton, you need to setup ROCT and PIMLibrary again. 
 
-####PIMMock
+#### PIM Library
+Please follow the guide for PIMLibrary (https://github.com/SAITPublic/PIMLibrary)
+Our test version is tested in the commit feb7206ac70b1f105ea5e9cda40e35ce2580d3cb.
+
+```bash
+
+cd $PIM_LIBRARY
+git checkout -b feb7206ac70b1f105ea5e9cda40e35ce2580d3cb
+
+# Build and install following the guide in PIMLibrary
+```
+
+
+#### PIMMock
+The first step in installing DPC++ is the setup of the PIM mock-up library used for emulation of PIM operations on the SYCL host device.
 PIMMock is required as below;
 
 ```bash
@@ -59,6 +72,8 @@ ninja install
 ```
 
 #### DPCPP
+In the next step, DPC++, the SYCL compiler, itself is built.
+Our version is based on the DPC++ commit 8edb62e5c10e1ba22b355225a6f4ccd09bdf098d.
 
 ```bash
 cd $BASE_DIR
@@ -73,6 +88,12 @@ cp <PIMPatches>/SYCL_dpcpp/00##.patch .
 # chmod +x applyPIMPatch.sh
 ./applyPIMPatch.sh
 
+```
+This step assumes that HIP and HSA runtime headers are installed in /opt/rocm/include. If the headers have been installed to a different directory (or no such symbolic link exists), the location of the headers can be specified with SYCL_BUILD_PI_HIP_HSA_INCLUDE_DIR and SYCL_BUILD_PI_HIP_INCLUDE_DIR.
+It is also assumed that the PIM Library has been installed in /opt/rocm (or a symbolic link exists). If this is not the case, the location of the PIM Library can be specified with the CMake variable SYCL_BUILD_PI_HIP_PIM_SDK_DIR. Further, it is assumed that the PIM Library runtime library is to be found in SYCL_BUILD_PI_HIP_PIM_SDK_DIR/lib/libPimRuntime.so and the PIM Library headers can be found in SYCL_BUILD_PI_HIP_PIM_SDK_DIR/include. If the library or headers are installed in a different location relative to SYCL_BUILD_PI_HIP_PIM_SDK_DIR, their exact location can be specified with CMake variables SYCL_BUILD_PI_PIM_SDK_LIBRARY and PIM_HEADERS, respectively.
+
+
+```bash
 mkdir build
 cd build
 
@@ -91,6 +112,11 @@ python ../buildbot/configure.py \
 
 ninja sycl-toolchain
 
+```
+
+We can check if the version is installed well through the comment below; 
+
+```bash
 # Make sure the following command lists a Samsung PIM device
 # We assume that PIM has only one 
 HIP_VISIBLE_DEVICES=1 ./bin/sycl-ls 
