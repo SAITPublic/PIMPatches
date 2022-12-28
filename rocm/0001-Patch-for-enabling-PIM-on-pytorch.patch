@@ -1,0 +1,211 @@
+From 3c887ff48b93c38afbbb28dfbc882c2881336e30 Mon Sep 17 00:00:00 2001
+From: Sudhakar M K <sudhakar.mk@samsung.com>
+Date: Fri, 28 May 2021 13:01:24 +0000
+Subject: [PATCH] Patch for enabling PIM on pytorch
+
+Details of patches:
+- Add PIMGemv for hidden gemv operation of LSTM
+- Enable bundle creation in PIMGemv
+- Add condition for PIM Gemv execution
+- Removed bundle API calls
+- Add fp16 path for miopen
+- Change PimGemv invoke condition for ATEN-PIM path
+- Remove PimInit/Deinit call from MIOpen library
+- Update LSTM to use optimal kernel
+- Change PimExecuteGemv to PimExecuteGemm
+
+Contributors:
+Sudhakar M K <sudhakar.mk@samsung.com>
+Hyeonsu Kim <hyeonsu.kim@samsung.com>
+Amit Yadav <amit.y@samsung.com>
+sundeep.k <sundeep.k@samsung.com>
+Hosang Yoon <hosang1.yoon@samsung.com>
+yao01.xiao <yao01.xiao@samsung.com>
+---
+ aten/src/ATen/CMakeLists.txt |  1 +
+ aten/src/ATen/native/RNN.cpp | 97 +++++++++++++++++++++++++++++++++++-
+ cmake/Dependencies.cmake     |  3 +-
+ cmake/public/LoadHIP.cmake   |  4 ++
+ 4 files changed, 102 insertions(+), 3 deletions(-)
+
+diff --git a/aten/src/ATen/CMakeLists.txt b/aten/src/ATen/CMakeLists.txt
+index 114d970bf7..f735fc35e9 100644
+--- a/aten/src/ATen/CMakeLists.txt
++++ b/aten/src/ATen/CMakeLists.txt
+@@ -439,6 +439,7 @@ if(USE_ROCM)
+   # NB: Instead of adding it to this list, we add it by hand
+   # to caffe2_hip, because it needs to be a PRIVATE dependency
+   # list(APPEND ATen_HIP_DEPENDENCY_LIBS ATEN_CUDA_FILES_GEN_LIB)
++  #  list(APPEND ATen_HIP_DEPENDENCY_LIBS PimRuntime)
+ endif()
+ 
+ set(ATEN_INCLUDE_DIR "${CMAKE_INSTALL_PREFIX}/${AT_INSTALL_INCLUDE_DIR}")
+diff --git a/aten/src/ATen/native/RNN.cpp b/aten/src/ATen/native/RNN.cpp
+index c30bb6f3f4..d5380292c0 100644
+--- a/aten/src/ATen/native/RNN.cpp
++++ b/aten/src/ATen/native/RNN.cpp
+@@ -9,6 +9,9 @@
+ #include <ATen/native/quantized/cpu/qnnpack_utils.h>
+ #include <torch/custom_class.h>
+ #include <torch/library.h>
++#include <pim_runtime_api.h>
++#include <half.hpp>
++#include <hip/hip_runtime.h>
+ 
+ torch::class_<LinearPackedParamsBase> register_linear_params();
+ 
+@@ -16,13 +19,67 @@ namespace at { namespace native {
+ 
+ namespace {
+ 
++Tensor PimGemm(const Tensor& h, const Tensor& wt)
++{
++    uint32_t batch = 1;
++    uint32_t channel = 1;
++    uint32_t h_size = h.size(0);
++    uint32_t in_size = h.size(1);
++    uint32_t out_size = wt.size(1);
++    uint32_t w_size = in_size * out_size;
++
++    PimGemmDesc *pim_desc = PimCreateGemmDesc(batch, channel, h_size, in_size, h_size, out_size, PIM_FP16, I_X_W);
++    PimBo *dev_in = PimCreateBo(pim_desc, MEM_TYPE_DEVICE, GEMM_INPUT, (void*)h.data_ptr());
++    uint64_t w_addr = reinterpret_cast<uint64_t>(wt.data_ptr());
++    PimBo *dev_weight = PimCreateBo(pim_desc, MEM_TYPE_DEVICE, GEMM_WEIGHT, reinterpret_cast<void*>(w_addr), true);
++
++    // or one can do this way:
++    // PimBo* host_weight = PimCreateBo(pim_desc, MEM_TYPE_HOST, GEMV_WEIGHT);
++    // hipMemcpy(host_weight->data, reinterpret_cast<void*>(w_addr), w_size * sizeof(half_float::half), hipMemcpyDeviceToHost);
++
++    auto output = at::empty({1, wt.size(1)}, h.options());
++    PimBo *dev_out = PimCreateBo(pim_desc, MEM_TYPE_DEVICE, GEMM_OUTPUT, (void*)output.data_ptr());
++
++    PimExecuteGemm(dev_out, dev_in, dev_weight, nullptr, PimActFunc::NONE, I_X_W, nullptr);
++
++    PimDestroyGemmDesc(pim_desc);
++    PimDestroyBo(dev_in);
++    PimDestroyBo(dev_weight);
++    PimDestroyBo(dev_out);
++
++    return output;
++}
++
+ // Check if pytorch is compiled with MIOpen.
+ bool use_miopen(const at::Tensor& input, const double dropout_state) {
+-    bool is_miopen_acceptable = ((input.scalar_type() == at::kFloat)|| (input.scalar_type() == at::kHalf)) &&
++
++    char env_p, *ptr;
++    if(std::getenv("ENABLE_MIOPEN_PYTORCH")) {
++      ptr = std::getenv("ENABLE_MIOPEN_PYTORCH");
++      env_p = *ptr;
++    }
++    else{
++      env_p = '0';
++    }
++    if(env_p == '0')
++      return false;
++
++    bool is_miopen_acceptable = (input.scalar_type() == at::kFloat  || input.scalar_type() == at::kHalf) &&
+                                 (detail::getCUDAHooks().compiledWithMIOpen()) &&
+                                 (input.is_cuda()) &&
+                                 (dropout_state == 0.0) &&
+                                 (at::globalContext().userEnabledCuDNN());
++
++    int in_is_vector = 0;
++    for (int i = 0; i < input.dim(); ++i) {
++      if (input.size(i) != 1) {
++        in_is_vector += 1;
++      }
++    }
++    if (in_is_vector == 1) {
++      is_miopen_acceptable = false;
++    }
++
+     return is_miopen_acceptable;
+ }
+ 
+@@ -105,9 +162,47 @@ struct CellParams : public CellParamsBase {
+   const Tensor& w_hr;  /* only defined for LSTMs with projections */
+ 
+   Tensor matmul_ih(const Tensor& input) const override {
++    char env_p, *ptr;
++
++    if(std::getenv("ENABLE_PIM")) {
++      ptr = std::getenv("ENABLE_PIM");
++      env_p = *ptr;
++    }
++    else
++      env_p = '0';
++
++    if(env_p == '1') {
++      auto size_vec = input.sizes().vec();
++      auto is_vector = std::count_if(size_vec.begin(), size_vec.end(), [](int64_t item) {
++        return item != 1;
++      });
++      if (is_vector == 1) {
++        return PimGemm(input, w_ih.t());
++      }
++    }
++
+     return at::matmul(input, w_ih.t());
+   }
+   Tensor matmul_hh(const Tensor& h) const override {
++    char env_p, *ptr;
++
++    if(std::getenv("ENABLE_PIM")) {
++      ptr = std::getenv("ENABLE_PIM");
++      env_p = *ptr;
++    }
++    else
++      env_p = '0';
++
++    if(env_p == '1') {
++      auto size_vec = h.sizes().vec();
++      auto is_vector = std::count_if(size_vec.begin(), size_vec.end(), [](int64_t item) {
++        return item != 1;
++      });
++      if (is_vector == 1) {
++        return PimGemm(h, w_hh.t());
++      }
++    }
++
+     return at::matmul(h, w_hh.t());
+   }
+   Tensor matmul_hr(const Tensor& h) const override {
+diff --git a/cmake/Dependencies.cmake b/cmake/Dependencies.cmake
+index ca560288a4..bc47c518f1 100644
+--- a/cmake/Dependencies.cmake
++++ b/cmake/Dependencies.cmake
+@@ -1283,8 +1283,7 @@ if(USE_ROCM)
+     # This is needed for library added by hip_add_library (same for hip_add_executable)
+     hip_include_directories(${Caffe2_HIP_INCLUDE})
+ 
+-    set(Caffe2_PUBLIC_HIP_DEPENDENCY_LIBS
+-      ${PYTORCH_HIP_HCC_LIBRARIES} ${PYTORCH_MIOPEN_LIBRARIES} ${PYTORCH_RCCL_LIBRARIES} ${hipcub_LIBRARIES} ${ROCM_HIPRTC_LIB} ${ROCM_ROCTX_LIB})
++    set(Caffe2_PUBLIC_HIP_DEPENDENCY_LIBS  ${PYTORCH_HIP_HCC_LIBRARIES} ${PYTORCH_MIOPEN_LIBRARIES} ${PYTORCH_RCCL_LIBRARIES} ${hipcub_LIBRARIES} ${ROCM_HIPRTC_LIB} ${ROCM_ROCTX_LIB} ${ROCM_PIM_LIB})
+ 
+     # Note [rocblas & rocfft cmake bug]
+     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+diff --git a/cmake/public/LoadHIP.cmake b/cmake/public/LoadHIP.cmake
+index 85ec5b4ad0..46a957d644 100644
+--- a/cmake/public/LoadHIP.cmake
++++ b/cmake/public/LoadHIP.cmake
+@@ -139,6 +139,9 @@ endif()
+ # Add HIP to the CMAKE Module Path
+ set(CMAKE_MODULE_PATH ${HIP_PATH}/cmake ${CMAKE_MODULE_PATH})
+ 
++# Disable Asserts In Code (Can't use asserts on HIP stack.)
++#add_definitions(-DNDEBUG)
++
+ macro(find_package_and_print_version PACKAGE_NAME)
+   find_package("${PACKAGE_NAME}" ${ARGN})
+   message("${PACKAGE_NAME} VERSION: ${${PACKAGE_NAME}_VERSION}")
+@@ -251,5 +254,6 @@ if(HIP_FOUND)
+   find_library(ROCM_HIPRTC_LIB ${hip_library_name} HINTS ${HIP_PATH}/lib)
+   # roctx is part of roctracer
+   find_library(ROCM_ROCTX_LIB roctx64 HINTS ${ROCTRACER_PATH}/lib)
++  find_library(ROCM_PIM_LIB PimRuntime HINTS ${ROCM_PATH}/lib)
+   set(roctracer_INCLUDE_DIRS ${ROCTRACER_PATH}/include)
+ endif()
+-- 
+2.17.1
+
